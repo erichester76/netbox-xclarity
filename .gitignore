@@ -1,0 +1,20 @@
+# Credentials — never commit a populated .env file
+.env
+
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging artefacts
+dist/
+build/
+*.egg-info/
+
+# SQLite cache created by pynetbox2
+.nbx_cache.sqlite3

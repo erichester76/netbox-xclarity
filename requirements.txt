@@ -1,0 +1,4 @@
+pynetbox>=7.0.0
+deepdiff>=6.0.0
+requests>=2.28.0
+python-dotenv>=1.0.0
