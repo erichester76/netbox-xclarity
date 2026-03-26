@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from typing import Any, Optional
 
@@ -173,34 +174,42 @@ class NetBoxSync:
     def __init__(self, nb: pynetbox2.NetBoxAPI, dry_run: bool = False) -> None:
         self.nb = nb
         self.dry_run = dry_run
-        self._manufacturer_id: Optional[int] = None
+        self._manufacturer_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Manufacturer
     # ------------------------------------------------------------------
 
-    def ensure_manufacturer(self) -> int:
-        """Return the NetBox ID for the Lenovo manufacturer, creating it if needed."""
-        if self._manufacturer_id is not None:
-            return self._manufacturer_id
+    def ensure_manufacturer(self, name: Optional[str] = None) -> Optional[int]:
+        """Return the NetBox ID for a manufacturer, creating it if needed.
+
+        If *name* is ``None`` the default Lenovo manufacturer is used.
+        Results are cached so repeated calls do not hit the API twice.
+        """
+        mfr_name = name or self.MANUFACTURER_NAME
+        if mfr_name in self._manufacturer_cache:
+            return self._manufacturer_cache[mfr_name]
+        mfr_slug = _slugify(mfr_name)
         obj = self._upsert(
             "dcim.manufacturers",
-            {"name": self.MANUFACTURER_NAME, "slug": self.MANUFACTURER_SLUG},
+            {"name": mfr_name, "slug": mfr_slug},
             lookup_fields=["slug"],
         )
-        self._manufacturer_id = self._id(obj)
-        return self._manufacturer_id
+        mfr_id = self._id(obj)
+        if mfr_id is not None:
+            self._manufacturer_cache[mfr_name] = mfr_id
+        return mfr_id
 
     # ------------------------------------------------------------------
     # Device type
     # ------------------------------------------------------------------
 
-    def ensure_device_type(self, model: str, part_number: str = "") -> Optional[int]:
+    def ensure_device_type(self, model: str, part_number: str = "", manufacturer_name: Optional[str] = None) -> Optional[int]:
         """Return the NetBox ID for a device type, creating it if needed."""
         if not model:
             return None
         slug = _slugify(model)
-        manufacturer_id = self.ensure_manufacturer()
+        manufacturer_id = self.ensure_manufacturer(manufacturer_name)
         payload: dict[str, Any] = {
             "manufacturer": manufacturer_id,
             "model": model,
@@ -231,6 +240,32 @@ class NetBoxSync:
     def ensure_site(self, name: str, slug: str) -> Optional[int]:
         """Return the NetBox ID for a site, creating it if needed."""
         obj = self._upsert("dcim.sites", {"name": name, "slug": slug}, lookup_fields=["slug"])
+        return self._id(obj)
+
+    # ------------------------------------------------------------------
+    # Location (room / area within a site)
+    # ------------------------------------------------------------------
+
+    def ensure_location(self, name: str, site_id: int) -> Optional[int]:
+        """Return the NetBox ID for a location (room/area within a site), creating it if needed."""
+        slug = _slugify(name)
+        obj = self._upsert(
+            "dcim.locations",
+            {"name": name, "slug": slug, "site": site_id},
+            lookup_fields=["name", "site"],
+        )
+        return self._id(obj)
+
+    # ------------------------------------------------------------------
+    # Rack
+    # ------------------------------------------------------------------
+
+    def ensure_rack(self, name: str, site_id: int, location_id: Optional[int] = None) -> Optional[int]:
+        """Return the NetBox ID for a rack, creating it if needed."""
+        payload: dict[str, Any] = {"name": name, "site": site_id}
+        if location_id is not None:
+            payload["location"] = location_id
+        obj = self._upsert("dcim.racks", payload, lookup_fields=["name", "site"])
         return self._id(obj)
 
     # ------------------------------------------------------------------
@@ -374,21 +409,23 @@ class Collector:
             self._sync_node(node)
 
     def _sync_node(self, node: dict) -> None:
-        name = node.get("name") or node.get("hostname") or node.get("uuid", "unknown")
+        raw_name = node.get("name") or node.get("hostname") or node.get("uuid", "unknown")
+        name = self._apply_name_regex(str(raw_name))
         logger.debug("Syncing node: %s", name)
 
-        model = node.get("machineType") or node.get("model") or ""
+        model = _build_model_name(node)
         part_number = node.get("partNumber") or node.get("productName") or ""
         serial = node.get("serialNumber") or node.get("serial") or ""
+        mfr_name = node.get("manufacturer") or None
 
-        device_type_id = self.nb_sync.ensure_device_type(model, part_number)
+        device_type_id = self.nb_sync.ensure_device_type(model, part_number, mfr_name)
         role_slug = _env("NETBOX_SERVER_ROLE", "server")
         role_id = self.nb_sync.ensure_device_role(
             name=role_slug.title(),
             slug=role_slug,
             color="2196f3",
         )
-        site_id = self._resolve_site(node)
+        site_id, location_id, rack_id, rack_position = self._resolve_placement(node)
 
         if device_type_id is None or role_id is None or site_id is None:
             logger.warning("Skipping node %s: missing device_type/role/site", name)
@@ -403,6 +440,13 @@ class Collector:
         }
         if serial:
             payload["serial"] = serial
+        if location_id is not None:
+            payload["location"] = location_id
+        if rack_id is not None:
+            payload["rack"] = rack_id
+            payload["face"] = "front"
+        if rack_position is not None and rack_id is not None:
+            payload["position"] = rack_position
 
         device = self.nb_sync.upsert_device(payload)
 
@@ -437,7 +481,7 @@ class Collector:
                 iface_payload: dict[str, Any] = {
                     "device": device_id,
                     "name": iface_name,
-                    "type": "1000base-t",
+                    "type": _port_type(port),
                 }
                 if mac:
                     iface_payload["mac_address"] = mac
@@ -491,54 +535,182 @@ class Collector:
                     })
 
     def _sync_node_inventory(self, node: dict, device_id: int) -> None:
-        """Sync CPUs, DIMMs, drives, PSUs and fans as inventory items."""
+        """Sync CPUs, DIMMs, disk drives, add-in cards, PSUs and fans as inventory items."""
+        default_mfr_id = self.nb_sync.ensure_manufacturer()
+
+        def _item_mfr_id(item: dict) -> Optional[int]:
+            """Return manufacturer ID for *item*, falling back to the device manufacturer."""
+            mfr = item.get("manufacturer") or item.get("mfrName") or None
+            return self.nb_sync.ensure_manufacturer(mfr) if mfr else default_mfr_id
+
         # CPUs
         for cpu in node.get("processors") or node.get("processorSlots") or []:
             name = cpu.get("productName") or cpu.get("description") or f"CPU {cpu.get('slot', '?')}"
+            desc_parts = [
+                cpu.get("model") or "",
+                f"{cpu['speed']} MHz" if cpu.get("speed") else "",
+                f"{cpu['cores']} cores" if cpu.get("cores") else "",
+            ]
             self.nb_sync.upsert_inventory_item({
                 "device": device_id,
                 "name": name,
-                "manufacturer": self.nb_sync.ensure_manufacturer(),
+                "manufacturer": _item_mfr_id(cpu),
                 "part_id": cpu.get("partNumber") or "",
                 "serial": cpu.get("serialNumber") or "",
-                "description": cpu.get("model") or cpu.get("speed") or "",
+                "description": ", ".join(p for p in desc_parts if p),
             })
 
         # Memory / DIMMs
         for dimm in node.get("memoryModules") or node.get("dimmSlots") or []:
             name = dimm.get("productName") or dimm.get("description") or f"DIMM {dimm.get('slot', '?')}"
+            capacity = dimm.get("capacity") or dimm.get("size") or ""
+            desc_parts = [
+                f"{capacity} MB" if capacity else "",
+                f"{dimm['speed']} MHz" if dimm.get("speed") else "",
+                dimm.get("memoryType") or dimm.get("type") or "",
+            ]
             self.nb_sync.upsert_inventory_item({
                 "device": device_id,
                 "name": name,
-                "manufacturer": self.nb_sync.ensure_manufacturer(),
+                "manufacturer": _item_mfr_id(dimm),
                 "part_id": dimm.get("partNumber") or "",
                 "serial": dimm.get("serialNumber") or "",
-                "description": str(dimm.get("capacity") or dimm.get("size") or ""),
+                "description": ", ".join(p for p in desc_parts if p),
             })
+
+        # Disk drives
+        for drive in (
+            node.get("diskDrives")
+            or node.get("drives")
+            or node.get("storageDisks")
+            or node.get("diskDriveList")
+            or []
+        ):
+            name = (
+                drive.get("productName")
+                or drive.get("description")
+                or drive.get("name")
+                or f"Drive {drive.get('slot', '?')}"
+            )
+            desc_parts = [
+                f"{drive['capacity']} GB" if drive.get("capacity") else "",
+                drive.get("type") or drive.get("interfaceType") or "",
+                f"{drive['rpm']} RPM" if drive.get("rpm") else "",
+                drive.get("model") or "",
+            ]
+            self.nb_sync.upsert_inventory_item({
+                "device": device_id,
+                "name": name,
+                "manufacturer": _item_mfr_id(drive),
+                "part_id": drive.get("partNumber") or "",
+                "serial": drive.get("serialNumber") or "",
+                "description": ", ".join(p for p in desc_parts if p),
+            })
+
+        # Add-in cards (PCIe)
+        for card in (
+            node.get("addinCards")
+            or node.get("pciExpressCards")
+            or node.get("pciCards")
+            or node.get("addinCardList")
+            or []
+        ):
+            name = (
+                card.get("productName")
+                or card.get("description")
+                or card.get("name")
+                or f"Addin Card {card.get('slot', '?')}"
+            )
+            desc_parts = [
+                f"PCI bus {card['pciBusNumber']}" if card.get("pciBusNumber") else "",
+                f"Slot {card['slot']}" if card.get("slot") else "",
+                card.get("slotName") or "",
+                card.get("type") or "",
+            ]
+            self.nb_sync.upsert_inventory_item({
+                "device": device_id,
+                "name": name,
+                "manufacturer": _item_mfr_id(card),
+                "part_id": card.get("partNumber") or "",
+                "serial": card.get("serialNumber") or "",
+                "description": ", ".join(p for p in desc_parts if p),
+            })
+
+            # Sync ethernet ports from this add-in card as device interfaces
+            if self._sync_interfaces:
+                self._sync_addin_card_interfaces(card, device_id)
 
         # Power supplies
         for psu in node.get("powerSupplies") or node.get("powerSupplySlots") or []:
             name = psu.get("productName") or psu.get("description") or f"PSU {psu.get('slot', '?')}"
+            desc_parts = [
+                psu.get("model") or "",
+                psu.get("inputVoltageType") or "",
+                f"{psu['outputWatts']} W" if psu.get("outputWatts") else "",
+            ]
             self.nb_sync.upsert_inventory_item({
                 "device": device_id,
                 "name": name,
-                "manufacturer": self.nb_sync.ensure_manufacturer(),
+                "manufacturer": _item_mfr_id(psu),
                 "part_id": psu.get("partNumber") or "",
                 "serial": psu.get("serialNumber") or "",
-                "description": psu.get("model") or "",
+                "description": ", ".join(p for p in desc_parts if p),
             })
 
         # Fans
         for fan in node.get("fans") or node.get("fanSlots") or []:
             name = fan.get("name") or fan.get("description") or f"Fan {fan.get('slot', '?')}"
+            desc_parts = [f"{fan['speed']} RPM" if fan.get("speed") else ""]
             self.nb_sync.upsert_inventory_item({
                 "device": device_id,
                 "name": name,
-                "manufacturer": self.nb_sync.ensure_manufacturer(),
+                "manufacturer": _item_mfr_id(fan),
                 "part_id": fan.get("partNumber") or "",
                 "serial": fan.get("serialNumber") or "",
-                "description": "",
+                "description": ", ".join(p for p in desc_parts if p),
             })
+
+    def _sync_addin_card_interfaces(self, card: dict, device_id: int) -> None:
+        """Sync ethernet ports from a PCIe add-in card as device interfaces."""
+        ports = card.get("portList") or card.get("ports") or []
+        for port in ports:
+            port_type_str = (port.get("type") or port.get("portType") or "").lower()
+            if "ethernet" not in port_type_str and "eth" not in port_type_str:
+                continue
+            port_index = port.get("portIndex", "?")
+            iface_name = port.get("portName") or port.get("name") or f"port-{port_index}"
+            mac = _normalise_mac(port.get("macAddress") or port.get("mac") or "")
+            iface_payload: dict[str, Any] = {
+                "device": device_id,
+                "name": iface_name,
+                "type": _port_type(port),
+            }
+            if mac:
+                iface_payload["mac_address"] = mac
+            iface = self.nb_sync.upsert_interface(iface_payload)
+            iface_id = self.nb_sync._id(iface)
+            if iface_id is None:
+                continue
+            # Sync IP addresses on this port
+            for ip_key in ("ipInterfaces", "ipAddresses", "ips"):
+                for ip_info in port.get(ip_key) or []:
+                    address = (
+                        ip_info.get("IPv4addresses")
+                        or ip_info.get("address")
+                        or ip_info.get("ipv4Address")
+                    )
+                    if isinstance(address, list):
+                        address = address[0] if address else None
+                    if not address:
+                        continue
+                    cidr = _to_cidr(address, ip_info.get("subnet") or ip_info.get("netmask"))
+                    if cidr:
+                        self.nb_sync.upsert_ip_address({
+                            "address": cidr,
+                            "assigned_object_type": "dcim.interface",
+                            "assigned_object_id": iface_id,
+                            "status": "active",
+                        })
 
     # ------------------------------------------------------------------
     # Chassis
@@ -557,21 +729,23 @@ class Collector:
             self._sync_chassis(chassis)
 
     def _sync_chassis(self, chassis: dict) -> None:
-        name = chassis.get("name") or chassis.get("hostname") or chassis.get("uuid", "unknown")
+        raw_name = chassis.get("name") or chassis.get("hostname") or chassis.get("uuid", "unknown")
+        name = self._apply_name_regex(str(raw_name))
         logger.debug("Syncing chassis: %s", name)
 
-        model = chassis.get("machineType") or chassis.get("model") or ""
+        model = _build_model_name(chassis)
         part_number = chassis.get("partNumber") or ""
         serial = chassis.get("serialNumber") or ""
+        mfr_name = chassis.get("manufacturer") or None
 
-        device_type_id = self.nb_sync.ensure_device_type(model, part_number)
+        device_type_id = self.nb_sync.ensure_device_type(model, part_number, mfr_name)
         role_slug = _env("NETBOX_CHASSIS_ROLE", "chassis")
         role_id = self.nb_sync.ensure_device_role(
             name=role_slug.title(),
             slug=role_slug,
             color="9c27b0",
         )
-        site_id = self._resolve_site(chassis)
+        site_id, location_id, rack_id, rack_position = self._resolve_placement(chassis)
 
         if device_type_id is None or role_id is None or site_id is None:
             logger.warning("Skipping chassis %s: missing device_type/role/site", name)
@@ -586,6 +760,13 @@ class Collector:
         }
         if serial:
             payload["serial"] = serial
+        if location_id is not None:
+            payload["location"] = location_id
+        if rack_id is not None:
+            payload["rack"] = rack_id
+            payload["face"] = "front"
+        if rack_position is not None and rack_id is not None:
+            payload["position"] = rack_position
 
         self.nb_sync.upsert_device(payload)
 
@@ -606,21 +787,23 @@ class Collector:
             self._sync_switch(switch)
 
     def _sync_switch(self, switch: dict) -> None:
-        name = switch.get("name") or switch.get("hostname") or switch.get("uuid", "unknown")
+        raw_name = switch.get("name") or switch.get("hostname") or switch.get("uuid", "unknown")
+        name = self._apply_name_regex(str(raw_name))
         logger.debug("Syncing switch: %s", name)
 
-        model = switch.get("machineType") or switch.get("model") or ""
+        model = _build_model_name(switch)
         part_number = switch.get("partNumber") or ""
         serial = switch.get("serialNumber") or ""
+        mfr_name = switch.get("manufacturer") or None
 
-        device_type_id = self.nb_sync.ensure_device_type(model, part_number)
+        device_type_id = self.nb_sync.ensure_device_type(model, part_number, mfr_name)
         role_slug = _env("NETBOX_SWITCH_ROLE", "switch")
         role_id = self.nb_sync.ensure_device_role(
             name=role_slug.title(),
             slug=role_slug,
             color="4caf50",
         )
-        site_id = self._resolve_site(switch)
+        site_id, location_id, rack_id, rack_position = self._resolve_placement(switch)
 
         if device_type_id is None or role_id is None or site_id is None:
             logger.warning("Skipping switch %s: missing device_type/role/site", name)
@@ -635,6 +818,13 @@ class Collector:
         }
         if serial:
             payload["serial"] = serial
+        if location_id is not None:
+            payload["location"] = location_id
+        if rack_id is not None:
+            payload["rack"] = rack_id
+            payload["face"] = "front"
+        if rack_position is not None and rack_id is not None:
+            payload["position"] = rack_position
 
         device = self.nb_sync.upsert_device(payload)
 
@@ -653,7 +843,7 @@ class Collector:
             iface_payload: dict[str, Any] = {
                 "device": device_id,
                 "name": port_name,
-                "type": "1000base-t",
+                "type": _port_type(port),
             }
             if mac:
                 iface_payload["mac_address"] = mac
@@ -676,21 +866,23 @@ class Collector:
             self._sync_storage(storage)
 
     def _sync_storage(self, storage: dict) -> None:
-        name = storage.get("name") or storage.get("hostname") or storage.get("uuid", "unknown")
+        raw_name = storage.get("name") or storage.get("hostname") or storage.get("uuid", "unknown")
+        name = self._apply_name_regex(str(raw_name))
         logger.debug("Syncing storage: %s", name)
 
-        model = storage.get("machineType") or storage.get("model") or ""
+        model = _build_model_name(storage)
         part_number = storage.get("partNumber") or ""
         serial = storage.get("serialNumber") or ""
+        mfr_name = storage.get("manufacturer") or None
 
-        device_type_id = self.nb_sync.ensure_device_type(model, part_number)
+        device_type_id = self.nb_sync.ensure_device_type(model, part_number, mfr_name)
         role_slug = _env("NETBOX_STORAGE_ROLE", "storage")
         role_id = self.nb_sync.ensure_device_role(
             name=role_slug.title(),
             slug=role_slug,
             color="ff9800",
         )
-        site_id = self._resolve_site(storage)
+        site_id, location_id, rack_id, rack_position = self._resolve_placement(storage)
 
         if device_type_id is None or role_id is None or site_id is None:
             logger.warning("Skipping storage %s: missing device_type/role/site", name)
@@ -705,36 +897,91 @@ class Collector:
         }
         if serial:
             payload["serial"] = serial
+        if location_id is not None:
+            payload["location"] = location_id
+        if rack_id is not None:
+            payload["rack"] = rack_id
+            payload["face"] = "front"
+        if rack_position is not None and rack_id is not None:
+            payload["position"] = rack_position
 
         self.nb_sync.upsert_device(payload)
 
     # ------------------------------------------------------------------
-    # Site resolution
+    # Name regex transformation
     # ------------------------------------------------------------------
 
-    def _resolve_site(self, device: dict) -> Optional[int]:
-        """Derive a NetBox site from device metadata, falling back to the default."""
-        location = (
-            device.get("location")
-            or device.get("dataCenter")
-            or device.get("room")
-            or {}
+    def _apply_name_regex(self, name: str) -> str:
+        """Apply hostname regex transformation defined in environment variables."""
+        return _apply_regex(
+            name,
+            _env("COLLECTOR_HOSTNAME_REGEX", ""),
+            _env("COLLECTOR_HOSTNAME_REPLACE", ""),
         )
-        if isinstance(location, dict):
-            site_name = (
-                location.get("dataCenter")
-                or location.get("room")
-                or location.get("lowestRackUnit")
-                or ""
+
+    # ------------------------------------------------------------------
+    # Placement resolution (site, location, rack, rack position)
+    # ------------------------------------------------------------------
+
+    def _resolve_placement(
+        self, device: dict
+    ) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+        """Return ``(site_id, location_id, rack_id, rack_position)`` from device metadata.
+
+        XClarity location mapping:
+
+        * ``location.location``      → NetBox **site**
+        * ``location.room``          → NetBox **location** (area within site)
+        * ``location.rack``          → NetBox **rack**
+        * ``location.lowestRackUnit`` → rack **position** (front face)
+        """
+        loc = device.get("location") or {}
+        if not isinstance(loc, dict):
+            loc = {}
+
+        # --- Site ---
+        site_raw = (
+            loc.get("location")
+            or device.get("dataCenter")
+            or loc.get("dataCenter")
+            or ""
+        )
+        if not site_raw:
+            site_raw = _env("NETBOX_DEFAULT_SITE", "default")
+        site_name = _apply_regex(
+            str(site_raw),
+            _env("COLLECTOR_LOCATION_REGEX", ""),
+            _env("COLLECTOR_LOCATION_REPLACE", ""),
+        )
+        site_id = self.nb_sync.ensure_site(site_name, _slugify(site_name))
+
+        # --- Location (room within the site) ---
+        room_raw = loc.get("room") or device.get("room") or ""
+        location_id: Optional[int] = None
+        if room_raw and site_id is not None:
+            room_name = _apply_regex(
+                str(room_raw),
+                _env("COLLECTOR_ROOM_REGEX", ""),
+                _env("COLLECTOR_ROOM_REPLACE", ""),
             )
-        else:
-            site_name = str(location)
+            location_id = self.nb_sync.ensure_location(room_name, site_id)
 
-        if not site_name:
-            site_name = _env("NETBOX_DEFAULT_SITE", "default")
+        # --- Rack ---
+        rack_raw = loc.get("rack") or device.get("rack") or ""
+        rack_id: Optional[int] = None
+        if rack_raw and site_id is not None:
+            rack_id = self.nb_sync.ensure_rack(str(rack_raw), site_id, location_id)
 
-        slug = _slugify(site_name)
-        return self.nb_sync.ensure_site(site_name, slug)
+        # --- Rack position ---
+        rack_position: Optional[int] = None
+        raw_pos = loc.get("lowestRackUnit")
+        if raw_pos is not None:
+            try:
+                rack_position = int(raw_pos)
+            except (ValueError, TypeError):
+                pass
+
+        return site_id, location_id, rack_id, rack_position
 
 
 # ---------------------------------------------------------------------------
@@ -743,12 +990,67 @@ class Collector:
 
 def _slugify(value: str) -> str:
     """Convert *value* to a NetBox-compatible slug (lowercase, hyphens)."""
-    import re
     value = value.lower().strip()
     value = re.sub(r"[^\w\s-]", "", value)
     value = re.sub(r"[\s_]+", "-", value)
     value = re.sub(r"-+", "-", value)
     return value[:100]
+
+
+def _apply_regex(value: str, pattern: str, replacement: str) -> str:
+    """Apply ``re.sub(pattern, replacement, value)``.
+
+    Returns *value* unchanged when *pattern* is empty or invalid.
+    """
+    if not pattern or not value:
+        return value
+    try:
+        return re.sub(pattern, replacement, value)
+    except re.error as exc:
+        logger.warning("Invalid regex '%s': %s", pattern, exc)
+        return value
+
+
+def _build_model_name(device: dict) -> str:
+    """Build a combined device-type model name from XClarity fields.
+
+    Format: ``<manufacturer> <productName> -[<machineType><model>]-``
+
+    Example: ``Lenovo ThinkSystem SR650 -[7X06CTO1WW]-``
+
+    Falls back to ``machineType`` or ``model`` alone when the richer fields
+    are absent, so behaviour is backwards-compatible.
+    """
+    manufacturer = device.get("manufacturer", "")
+    product_name = device.get("productName", "")
+    machine_type = device.get("machineType", "")
+    model_code = device.get("model", "")
+    parts: list[str] = []
+    if manufacturer:
+        parts.append(manufacturer)
+    if product_name:
+        parts.append(product_name)
+    suffix = f"{machine_type}{model_code}".strip()
+    if suffix:
+        parts.append(f"-[{suffix}]-")
+    return " ".join(parts) if parts else (machine_type or model_code or "")
+
+
+def _port_type(port: dict) -> str:
+    """Infer a NetBox interface type string from XClarity port speed/type data."""
+    speed = str(port.get("speed") or port.get("portSpeed") or "").lower()
+    # Extract numeric tokens so substring matches do not cause false positives
+    # (e.g. "10000" must not be confused with "100000").
+    nums = set(re.findall(r"\d+", speed))
+    if "100g" in speed or "100000" in nums:
+        return "100gbase-x-qsfp28"
+    if "40g" in speed or "40000" in nums:
+        return "40gbase-x-qsfpp"
+    if "25g" in speed or "25000" in nums:
+        return "25gbase-x-sfp28"
+    if "10g" in speed or "10000" in nums:
+        return "10gbase-t"
+    return "1000base-t"
 
 
 def _normalise_mac(mac: str) -> str:
