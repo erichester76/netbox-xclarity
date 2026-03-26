@@ -1139,25 +1139,6 @@ class Collector:
         # bay templates to it.
         device_type_id = self._get_device_type_id(device_id)
 
-        # Pre-warm the cache for all module-related resources for this device
-        # in a single batch of API calls rather than one-by-one per slot.
-        prewarm_resources: dict[str, dict[str, Any]] = {
-            "dcim.module_bays": {"device_id": device_id},
-            "dcim.modules": {"device_id": device_id},
-            "dcim.module_types": {},
-        }
-        if device_type_id is not None:
-            prewarm_resources["dcim.module_bay_templates"] = {"device_type_id": device_type_id}
-        try:
-            self.nb_sync.nb.prewarm(prewarm_resources)
-        except Exception as exc:
-            # Prewarm is a pure performance optimisation; failure means later
-            # individual lookups will hit the API directly rather than cache.
-            logger.warning(
-                "Cache prewarm failed for device_id=%s (sync will continue with uncached lookups): %s",
-                device_id,
-                exc,
-            )
         # Maps bay_name → module_id; returned to the caller so interfaces can
         # be linked to the correct module.
         slot_module_map: dict[str, int] = {}
