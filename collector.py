@@ -994,6 +994,26 @@ class Collector:
         # bay templates to it.
         device_type_id = self._get_device_type_id(device_id)
 
+        # Pre-warm the cache for all module-related resources for this device
+        # in a single batch of API calls rather than one-by-one per slot.
+        prewarm_resources: dict[str, dict[str, Any]] = {
+            "dcim.module_bays": {"device_id": device_id},
+            "dcim.modules": {"device_id": device_id},
+            "dcim.module_types": {},
+        }
+        if device_type_id is not None:
+            prewarm_resources["dcim.module_bay_templates"] = {"device_type_id": device_type_id}
+        try:
+            self.nb_sync.nb.prewarm(prewarm_resources)
+        except Exception as exc:
+            # Prewarm is a pure performance optimisation; failure means later
+            # individual lookups will hit the API directly rather than cache.
+            logger.warning(
+                "Cache prewarm failed for device_id=%s (sync will continue with uncached lookups): %s",
+                device_id,
+                exc,
+            )
+
         def _ensure_slot(bay_name: str, position: str = "") -> Optional[int]:
             """Ensure a bay template + bay instance exist; return the bay ID."""
             if device_type_id is not None:
@@ -1609,6 +1629,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         token=_env("NETBOX_TOKEN"),
         rate_limit_per_second=float(_env("NETBOX_RATE_LIMIT", "5")),
         retry_attempts=int(_env("NETBOX_RETRY_ATTEMPTS", "3")),
+        cache_backend=_env("NETBOX_CACHE_BACKEND", "sqlite"),
+        cache_ttl_seconds=int(_env("NETBOX_CACHE_TTL", "300")),
+        sqlite_path=_env("NETBOX_CACHE_SQLITE_PATH", ".nbx_cache.sqlite3"),
+        redis_url=_env("NETBOX_CACHE_REDIS_URL", "redis://localhost:6379/0"),
     )
 
     nb_sync = NetBoxSync(nb, dry_run=args.dry_run)
