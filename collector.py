@@ -367,12 +367,17 @@ class NetBoxSync:
         model: str,
         manufacturer_name: Optional[str] = None,
         profile_name: Optional[str] = None,
+        attributes: Optional[dict] = None,
     ) -> Optional[int]:
         """Return the NetBox ID for a module type, creating it if needed.
 
         *profile_name*, when supplied, is used to look up or create a
         ``ModuleTypeProfile`` (NetBox 4.0+) which is then linked to the
         module type via the ``profile`` field.
+
+        *attributes*, when supplied, is stored as ``attribute_data`` on the
+        module type so that profile-specific fields (e.g. CPU cores/speed) are
+        visible on the type record in NetBox.
         """
         if not model:
             return None
@@ -387,6 +392,10 @@ class NetBoxSync:
             profile_id = self.ensure_module_type_profile(profile_name)
             if profile_id is not None:
                 payload["profile"] = profile_id
+        if attributes:
+            clean_attrs = {k: v for k, v in attributes.items() if v is not None}
+            if clean_attrs:
+                payload["attribute_data"] = clean_attrs
         obj = self._upsert(
             "dcim.module_types",
             payload,
@@ -1161,7 +1170,7 @@ class Collector:
             """Install a module in *bay_id*; return its NetBox ID (or None)."""
             if bay_id is None or not model:
                 return None
-            module_type_id = self.nb_sync.ensure_module_type(model, mfr_name, profile_name)
+            module_type_id = self.nb_sync.ensure_module_type(model, mfr_name, profile_name, attributes)
             if module_type_id is None:
                 return None
             payload: dict[str, Any] = {
@@ -1628,7 +1637,7 @@ def _cpu_attributes(cpu: dict) -> dict:
             attrs["speed"] = float(speed)
     except (ValueError, TypeError):
         pass
-    arch = cpu.get("architecture") or cpu.get("cpuFamily")
+    arch = cpu.get("architecture") or cpu.get("cpuFamily") or cpu.get("family")
     if arch:
         attrs["architecture"] = str(arch)
     return attrs
