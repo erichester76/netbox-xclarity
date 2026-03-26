@@ -1156,6 +1156,7 @@ class Collector:
             serial: str,
             mfr_name: Optional[str],
             profile_name: Optional[str] = None,
+            attributes: Optional[dict] = None,
         ) -> Optional[int]:
             """Install a module in *bay_id*; return its NetBox ID (or None)."""
             if bay_id is None or not model:
@@ -1171,6 +1172,13 @@ class Collector:
             }
             if serial:
                 payload["serial"] = serial
+            # Store profile-specific attributes when available (NetBox 4.0+).
+            # Only include keys whose value is not None so required fields without
+            # data are omitted rather than sent as null.
+            if attributes:
+                clean_attrs = {k: v for k, v in attributes.items() if v is not None}
+                if clean_attrs:
+                    payload["attribute_data"] = clean_attrs
             module = self.nb_sync.upsert_module(payload)
             module_id = self.nb_sync._id(module)
             if module_id is not None and bay_name:
@@ -1194,7 +1202,7 @@ class Collector:
                 or cpu.get("model")
                 or ""
             )
-            _install_module(bay_id, bay_name, model, cpu.get("serialNumber") or "", cpu.get("manufacturer"), "CPU")
+            _install_module(bay_id, bay_name, model, cpu.get("serialNumber") or "", cpu.get("manufacturer"), "CPU", _cpu_attributes(cpu))
 
         # ------------------------------------------------------------------
         # Memory / DIMMs
@@ -1212,7 +1220,7 @@ class Collector:
             mem_type = dimm.get("type") or dimm.get("memoryType") or dimm.get("model") or ""
             part = dimm.get("partNumber") or ""
             model = part or (f"{capacity}GB {mem_type}".strip() if capacity or mem_type else "")
-            _install_module(bay_id, bay_name, model, dimm.get("serialNumber") or "", dimm.get("manufacturer"), "Memory")
+            _install_module(bay_id, bay_name, model, dimm.get("serialNumber") or "", dimm.get("manufacturer"), "Memory", _memory_attributes(dimm))
 
         # ------------------------------------------------------------------
         # Disk drives (from raidSettings and top-level)
@@ -1236,7 +1244,7 @@ class Collector:
             media = drive.get("mediaType") or drive.get("interfaceType") or ""
             part = drive.get("partNumber") or ""
             model_str = drive.get("model") or part or (f"{capacity_gb}GB {media}".strip() if capacity_gb or media else "")
-            _install_module(bay_id, bay_name, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"), "Hard disk")
+            _install_module(bay_id, bay_name, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"), "Hard disk", _storage_attributes(drive, capacity_gb)))
 
         for d in (node.get("diskDrives") or node.get("drives") or node.get("storageDisks") or node.get("diskDriveList") or []):
             _sync_drive_module(d)
@@ -1259,7 +1267,7 @@ class Collector:
             bay_id = _ensure_slot(slot_name, position)
             model = card.get("productName") or card.get("name") or card.get("description") or ""
             serial = card.get("serialNumber") or card.get("fruSerialNumber") or ""
-            _install_module(bay_id, slot_name, model, serial, card.get("manufacturer"), "Expansion card")
+            _install_module(bay_id, slot_name, model, serial, card.get("manufacturer"), "Expansion card", _expansion_card_attributes(card))
 
         # ------------------------------------------------------------------
         # Power supplies
@@ -1271,7 +1279,7 @@ class Collector:
             bay_name = psu.get("name") or psu.get("description") or f"Power Supply {position}"
             bay_id = _ensure_slot(bay_name, position)
             model = psu.get("partNumber") or psu.get("model") or psu.get("productName") or ""
-            module_id = _install_module(bay_id, bay_name, model, psu.get("serialNumber") or "", psu.get("manufacturer"), "Power supply")
+            module_id = _install_module(bay_id, bay_name, model, psu.get("serialNumber") or "", psu.get("manufacturer"), "Power supply", _psu_attributes(psu))
             # Add a C14 power inlet port to the PSU module so the power draw
             # can be tracked and cables can be attached.
             if module_id is not None:
@@ -1291,7 +1299,7 @@ class Collector:
             bay_id = _ensure_slot(bay_name, position)
             # Fans rarely have a meaningful model; skip module install if no part number
             model = fan.get("partNumber") or fan.get("model") or ""
-            _install_module(bay_id, bay_name, model, fan.get("serialNumber") or "", fan.get("manufacturer"), "Fan")
+            _install_module(bay_id, bay_name, model, fan.get("serialNumber") or "", fan.get("manufacturer"), "Fan", _fan_attributes(fan))
 
         # ------------------------------------------------------------------
         # Backplanes (faceplateIDs)
@@ -1600,6 +1608,148 @@ class Collector:
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
+
+def _cpu_attributes(cpu: dict) -> dict:
+    """Extract NetBox module profile attributes for a CPU component.
+
+    Returns a dict with only the fields that can be determined from *cpu*.
+    The caller is responsible for omitting empty dicts from the payload.
+    """
+    attrs: dict = {}
+    try:
+        cores = cpu.get("cores")
+        if cores is not None:
+            attrs["cores"] = int(cores)
+    except (ValueError, TypeError):
+        pass
+    try:
+        speed = cpu.get("speed")
+        if speed is not None:
+            attrs["speed"] = float(speed)
+    except (ValueError, TypeError):
+        pass
+    arch = cpu.get("architecture") or cpu.get("cpuFamily")
+    if arch:
+        attrs["architecture"] = str(arch)
+    return attrs
+
+
+def _memory_attributes(dimm: dict) -> dict:
+    """Extract NetBox module profile attributes for a Memory (DIMM) component."""
+    attrs: dict = {}
+    try:
+        capacity = dimm.get("capacity") or dimm.get("size")
+        if capacity is not None:
+            attrs["size"] = int(capacity)
+    except (ValueError, TypeError):
+        pass
+    mem_type_raw = (dimm.get("memoryType") or dimm.get("type") or "").upper()
+    for prefix in ("DDR5", "DDR4", "DDR3"):
+        if prefix in mem_type_raw:
+            attrs["class"] = prefix
+            break
+    try:
+        speed = dimm.get("speed")
+        if speed is not None:
+            attrs["data_rate"] = int(speed)
+    except (ValueError, TypeError):
+        pass
+    ecc = dimm.get("eccEnabled") if dimm.get("eccEnabled") is not None else dimm.get("ecc")
+    if ecc is not None:
+        attrs["ecc"] = bool(ecc)
+    return attrs
+
+
+def _storage_attributes(drive: dict, capacity_gb: int) -> dict:
+    """Extract NetBox module profile attributes for a Storage (disk) component."""
+    attrs: dict = {}
+    if capacity_gb:
+        attrs["size"] = int(capacity_gb)
+    try:
+        rpm = drive.get("rpm")
+        if rpm is not None:
+            attrs["speed"] = int(rpm)
+    except (ValueError, TypeError):
+        pass
+    media_raw = (drive.get("mediaType") or drive.get("type") or drive.get("interfaceType") or "").upper()
+    if "NVME" in media_raw or "NVM" in media_raw:
+        attrs["type"] = "NVME"
+    elif "SSD" in media_raw or "SOLID" in media_raw or "FLASH" in media_raw:
+        attrs["type"] = "SSD"
+    elif media_raw:
+        attrs["type"] = "HD"
+    return attrs
+
+
+def _expansion_card_attributes(card: dict) -> dict:
+    """Extract NetBox module profile attributes for an Expansion Card component."""
+    attrs: dict = {}
+    try:
+        bandwidth = card.get("bandwidth")
+        if bandwidth is not None:
+            attrs["bandwidth"] = int(bandwidth)
+    except (ValueError, TypeError):
+        pass
+    connector = (
+        card.get("pciExpressConnectorType")
+        or card.get("connectorType")
+        or card.get("slotType")
+        or ""
+    )
+    if connector:
+        attrs["connector_type"] = str(connector)
+    return attrs
+
+
+def _fan_attributes(fan: dict) -> dict:
+    """Extract NetBox module profile attributes for a Fan component."""
+    attrs: dict = {}
+    try:
+        rpm = fan.get("speed") or fan.get("rpm")
+        if rpm is not None:
+            attrs["rpm"] = int(rpm)
+    except (ValueError, TypeError):
+        pass
+    return attrs
+
+
+def _psu_attributes(psu: dict) -> dict:
+    """Extract NetBox module profile attributes for a Power Supply component."""
+    attrs: dict = {}
+    # input_current: required by profile schema; default to AC
+    if psu.get("inputVoltageIsAC") is False:
+        attrs["input_current"] = "DC"
+    else:
+        input_v_type = (psu.get("inputVoltageType") or "").upper()
+        attrs["input_current"] = "DC" if input_v_type == "DC" else "AC"
+    # input_voltage: required by profile schema
+    try:
+        input_v = (
+            psu.get("inputVoltage")
+            or psu.get("normalInputVoltage")
+            or psu.get("nominalVoltage")
+        )
+        if input_v is not None:
+            attrs["input_voltage"] = int(input_v)
+    except (ValueError, TypeError):
+        pass
+    # wattage (available output power)
+    try:
+        output_watts = psu.get("outputWatts")
+        if output_watts is None:
+            output_watts = (psu.get("powerAllocation") or {}).get("totalOutputPower")
+        if output_watts is not None:
+            attrs["wattage"] = int(output_watts)
+    except (ValueError, TypeError):
+        pass
+    # hot_swappable
+    hot_swap = psu.get("hotSwappable")
+    if hot_swap is None:
+        hot_swap = psu.get("isHotSwappable")
+    if hot_swap is not None:
+        attrs["hot_swappable"] = bool(hot_swap)
+    return attrs
+
 
 def _slugify(value: str) -> str:
     """Convert *value* to a NetBox-compatible slug (lowercase, hyphens)."""
