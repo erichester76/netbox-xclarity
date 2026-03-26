@@ -1244,7 +1244,7 @@ class Collector:
             media = drive.get("mediaType") or drive.get("interfaceType") or ""
             part = drive.get("partNumber") or ""
             model_str = drive.get("model") or part or (f"{capacity_gb}GB {media}".strip() if capacity_gb or media else "")
-            _install_module(bay_id, bay_name, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"), "Hard disk", _storage_attributes(drive, capacity_gb)))
+            _install_module(bay_id, bay_name, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"), "Hard disk", _storage_attributes(drive, capacity_gb))
 
         for d in (node.get("diskDrives") or node.get("drives") or node.get("storageDisks") or node.get("diskDriveList") or []):
             _sync_drive_module(d)
