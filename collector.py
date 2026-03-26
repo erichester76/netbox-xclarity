@@ -351,11 +351,10 @@ class NetBoxSync:
         attaching shared custom fields to each category (CPU, Memory, etc.).
         If the endpoint does not exist (pre-4.0) the call returns None silently.
         """
-        slug = _slugify(name)
         obj = self._upsert(
             "dcim.module_type_profiles",
-            {"name": name, "slug": slug},
-            lookup_fields=["slug"],
+            {"name": name},
+            lookup_fields=["name"],
         )
         return self._id(obj)
 
