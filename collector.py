@@ -49,6 +49,9 @@ class XClarityClient:
     * ``/chassis``  – chassis (blade-centre chassis)
     * ``/switches`` – managed top-of-rack / embedded switches
     * ``/storage``  – managed storage subsystems
+
+    The REST API is accessed directly at the host root (e.g. ``/nodes``),
+    not under any ``/aicc`` prefix.
     """
 
     def __init__(
@@ -60,7 +63,7 @@ class XClarityClient:
         verify_ssl: bool = True,
         timeout: int = 30,
     ) -> None:
-        self.base_url = f"https://{host}:{port}/aicc"
+        self.base_url = f"https://{host}:{port}"
         self.timeout = timeout
         self.verify_ssl = verify_ssl
         self._session = requests.Session()
