@@ -416,7 +416,7 @@ class NetBoxSync:
 
     def upsert_power_port(self, payload: dict[str, Any]) -> Optional[Any]:
         """Create or update a power port on a device (or module)."""
-        return self._upsert("dcim.power_ports", payload, lookup_fields=["device", "name"])
+        return self._upsert("dcim.power_ports", payload, lookup_fields=["device", "module", "name"])
 
     # ------------------------------------------------------------------
     # IP address
@@ -1272,7 +1272,7 @@ class Collector:
         # ------------------------------------------------------------------
         # Power supplies
         # ------------------------------------------------------------------
-        for psu in node.get("powerSupplies") or node.get("powerSupplySlots") or []:
+        for i, psu in enumerate(node.get("powerSupplies") or node.get("powerSupplySlots") or [], start=1):
             # slots is a list; take the first element as position
             slots = psu.get("slots") or []
             position = str(slots[0]) if slots else str(psu.get("slot", ""))
@@ -1286,7 +1286,7 @@ class Collector:
                 self.nb_sync.upsert_power_port({
                     "device": device_id,
                     "module": module_id,
-                    "name": "Power Input",
+                    "name": f"Power Input {i}",
                     "type": "iec-60320-c14",
                 })
 
