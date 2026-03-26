@@ -45,11 +45,13 @@ FK_FIELDS = {
     "dcim.device_roles": [],
     "dcim.platforms": ["manufacturer"],
     "dcim.virtual_chassis": [],
-    "dcim.inventory_items": ["device"],
+    "dcim.inventory_items": ["device", "role"],
+    "dcim.inventory_item_roles": [],
     "dcim.device_bays": ["device"],
     "dcim.module_types": ["manufacturer"],
     "dcim.modules": ["device", "module_bay", "module_type"],
     "dcim.module_bays": ["device"],
+    "dcim.module_bay_templates": ["device_type"],
     "dcim.power_feeds": ["power_panel"],
     "dcim.power_outlets": ["device", "power_port"],
     "dcim.power_panels": ["site"],
@@ -746,10 +748,12 @@ def _default_diode_entity_builder(resource: str, data: Mapping[str, Any]) -> Any
         "dcim.platforms": "platform",
         "dcim.virtual_chassis": "virtual_chassis",
         "dcim.inventory_items": "inventory_item",
+        "dcim.inventory_item_roles": "inventory_item_role",
         "dcim.device_bays": "device_bay",
         "dcim.module_types": "module_type",
         "dcim.modules": "module",
         "dcim.module_bays": "module_bay",
+        "dcim.module_bay_templates": "module_bay_template",
         "dcim.power_feeds": "power_feed",
         "dcim.power_outlets": "power_outlet",
         "dcim.power_panels": "power_panel",
@@ -1280,6 +1284,7 @@ class NetBoxExtendedClient:
         "dcim.module_bays": "modulebay",
         "dcim.module_types": "moduletype",
         "dcim.modules": "module",
+        "dcim.module_bay_templates": "modulebaytemplates",
         "dcim.power_feeds": "powerfeed",
         "dcim.power_outlets": "poweroutlet",
         "dcim.power_panels": "powerpanel",
@@ -1289,6 +1294,7 @@ class NetBoxExtendedClient:
         "dcim.virtual_chassis": "virtualchassis",
         "dcim.device_bays": "devicebay",
         "dcim.inventory_items": "inventoryitem",
+        "dcim.inventory_item_roles": "inventoryitemrole",
         "dcim.virtual_device_contexts": "virtualdevicecontext",
         "dcim.platforms": "platform",
         "extras.config_contexts": "configcontext",
@@ -1573,6 +1579,13 @@ class NetBoxExtendedClient:
         def norm_list(lst):
             return sorted([normalize(x) for x in lst])
 
+        # NetBox choice fields are returned as {"value": ..., "label": ...} dicts.
+        # Normalize them to just the value string so that e.g. "active" compares
+        # equal to {"value": "active", "label": "Active"} and spurious updates
+        # for fields like status/face are avoided.
+        if isinstance(value, dict) and "value" in value and "label" in value:
+            return normalize(value["value"])
+
         # Dict normalization
         if isinstance(value, dict):
             normed = {}
@@ -1779,6 +1792,14 @@ class NetBoxExtendedClient:
             return "site_id"
         if resource == "dcim.interfaces" and field == "device":
             return "device_id"
+        if resource in ("dcim.module_bays", "dcim.modules", "dcim.inventory_items") and field == "device":
+            return "device_id"
+        if resource == "dcim.modules" and field == "module_bay":
+            return "module_bay_id"
+        if resource == "dcim.module_bay_templates" and field == "device_type":
+            return "device_type_id"
+        if resource == "dcim.module_types" and field == "manufacturer":
+            return "manufacturer_id"
         if resource == "virtualization.interfaces" and field == "virtual_machine":
             return "virtual_machine_id"
         if resource == "virtualization.virtual_machines" and field == "cluster":
