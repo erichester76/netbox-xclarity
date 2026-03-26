@@ -122,9 +122,21 @@ FK_FIELDS = {
     "vpn.tunnel_termination_groups": [],
 }
 
-# Shared FK normalization function zfor use in all NetBox API calls
-def normalize_fk_fields(resource: str, payload: dict) -> dict:
-    # Always normalize any field ending in _id, or known FK fields
+# Shared FK normalization function for use in all NetBox API calls
+def normalize_fk_fields(resource: str, payload: dict, for_write: bool = False) -> dict:
+    """Normalise FK fields in *payload* for the given *resource*.
+
+    When *for_write* is ``False`` (the default, used for GET filter params)
+    integer FK values are renamed from the plain field name to the ``_id``
+    form expected by NetBox filter parameters (e.g. ``manufacturer`` →
+    ``manufacturer_id``).
+
+    When *for_write* is ``True`` (used for POST/PATCH write payloads) integer
+    FK values are **kept under their original field name** because the NetBox
+    write API expects ``{"manufacturer": 1}`` not ``{"manufacturer_id": 1}``.
+    Nested object/dict values are still unwrapped to their integer IDs in both
+    modes, but the field name is preserved in write mode.
+    """
     fields = set(payload.keys())
     for field in list(fields):
         value = payload[field]
@@ -144,8 +156,17 @@ def normalize_fk_fields(resource: str, payload: dict) -> dict:
                 if target_field != field:
                     del payload[field]
             elif isinstance(value, int) and not field.endswith("_id"):
-                payload[target_field] = value
-                del payload[field]
+                if for_write:
+                    # For POST/PATCH bodies keep the plain field name so that
+                    # NetBox receives e.g. {"manufacturer": 1} which it accepts
+                    # as an integer FK.  Renaming to manufacturer_id here would
+                    # cause a 400 "This field is required" on older NetBox
+                    # versions that do not recognise the _id alias in write ops.
+                    pass
+                else:
+                    # For GET filter params NetBox expects the _id suffix form.
+                    payload[target_field] = value
+                    del payload[field]
     return payload
 
 class RateLimiter:
@@ -1609,6 +1630,19 @@ class NetBoxExtendedClient:
         if isinstance(value, str) and key in ('tags',):
             return value.lower()
 
+        # Normalise FK objects (e.g. pynetbox Record instances) to their integer
+        # ID so that comparisons against an integer FK value in the desired
+        # payload do not produce a spurious diff.  We deliberately check that
+        # the value is not one of the scalar/collection types already handled
+        # above to avoid false positives.
+        if (
+            not isinstance(value, (int, float, str, bool, type(None), dict, list, tuple, set))
+            and hasattr(value, "id")
+        ):
+            id_val = getattr(value, "id", None)
+            if isinstance(id_val, int):
+                return id_val
+
         return value
 
     def _build_existing_subset(self, existing: Any, keys: Sequence[str]) -> dict[str, Any]:
@@ -1840,7 +1874,7 @@ class NetBoxExtendedClient:
         return results
 
     def create(self, resource: str, data: Mapping[str, Any]) -> Any:
-        payload = normalize_fk_fields(resource, dict(data))
+        payload = normalize_fk_fields(resource, dict(data), for_write=True)
         logger.debug("NetBox create resource=%s payload_keys=%s", resource, sorted(payload.keys()))
         created = self.adapter.create(resource, payload)
         logger.debug("NetBox create complete resource=%s id=%s", resource, self._extract_id(created))
@@ -1849,7 +1883,7 @@ class NetBoxExtendedClient:
         return created
 
     def update(self, resource: str, object_id: Any, data: Mapping[str, Any]) -> Any:
-        payload = normalize_fk_fields(resource, dict(data))
+        payload = normalize_fk_fields(resource, dict(data), for_write=True)
         logger.debug(
             "NetBox update resource=%s id=%s payload_keys=%s",
             resource,
@@ -1874,9 +1908,7 @@ class NetBoxExtendedClient:
         preserve_fields: Optional[Sequence[str]] = None,
         use_cache_for_lookup: bool = True,
     ) -> Any:
-        payload = normalize_fk_fields(resource, dict(data))
-
-        # Diode mode is fire-and-forget ingest: do not perform existence lookups.
+        payload = normalize_fk_fields(resource, dict(data), for_write=True)
         if isinstance(self.adapter, DiodeAdapter):
             logger.debug(
                 "Diode upsert passthrough resource=%s payload_keys=%s",
