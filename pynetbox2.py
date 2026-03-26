@@ -1900,7 +1900,7 @@ class NetBoxExtendedClient:
             value = payload[field]
 
             normalized_field = field
-            if not field.endswith("id") and isinstance(int,value) and field in FK_FIELDS[resource]:
+            if not field.endswith("id") and isinstance(value, int) and field in FK_FIELDS[resource]:
                 normalized_field = f"{field}_id"
             if hasattr(value, "id"):
                 value = getattr(value, "id")
