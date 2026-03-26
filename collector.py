@@ -291,6 +291,54 @@ class NetBoxSync:
         lookup = ["serial"] if payload.get("serial") else ["name"]
         return self._upsert("dcim.devices", payload, lookup_fields=lookup)
 
+    def ensure_inventory_item_role(self, name: str) -> Optional[int]:
+        """Return the NetBox ID for an inventory item role, creating it if needed."""
+        slug = _slugify(name)
+        obj = self._upsert(
+            "dcim.inventory_item_roles",
+            {"name": name, "slug": slug, "color": "9e9e9e"},
+            lookup_fields=["slug"],
+        )
+        return self._id(obj)
+
+    # ------------------------------------------------------------------
+    # Module bay (slot instance on a device)
+    # ------------------------------------------------------------------
+
+    def ensure_module_bay(self, device_id: int, name: str) -> Optional[int]:
+        """Return the NetBox ID for a module bay on a device, creating it if needed."""
+        obj = self._upsert(
+            "dcim.module_bays",
+            {"device": device_id, "name": name},
+            lookup_fields=["device", "name"],
+        )
+        return self._id(obj)
+
+    # ------------------------------------------------------------------
+    # Module type
+    # ------------------------------------------------------------------
+
+    def ensure_module_type(self, model: str, manufacturer_name: Optional[str] = None) -> Optional[int]:
+        """Return the NetBox ID for a module type, creating it if needed."""
+        if not model:
+            return None
+        slug = _slugify(model)
+        manufacturer_id = self.ensure_manufacturer(manufacturer_name)
+        obj = self._upsert(
+            "dcim.module_types",
+            {"manufacturer": manufacturer_id, "model": model, "slug": slug},
+            lookup_fields=["manufacturer", "slug"],
+        )
+        return self._id(obj)
+
+    # ------------------------------------------------------------------
+    # Module (installed component)
+    # ------------------------------------------------------------------
+
+    def upsert_module(self, payload: dict[str, Any]) -> Optional[Any]:
+        """Create or update a module installed in a module bay."""
+        return self._upsert("dcim.modules", payload, lookup_fields=["device", "module_bay"])
+
     # ------------------------------------------------------------------
     # Interface
     # ------------------------------------------------------------------
@@ -373,6 +421,7 @@ class Collector:
         self._categories = [c.strip() for c in _env("COLLECTOR_CATEGORIES", "nodes,chassis,switches,storage").split(",")]
         self._sync_interfaces = _env("COLLECTOR_SYNC_INTERFACES", "true").lower() not in ("false", "0", "no")
         self._sync_inventory = _env("COLLECTOR_SYNC_INVENTORY", "true").lower() not in ("false", "0", "no")
+        self._use_modules = _env("COLLECTOR_USE_MODULES", "false").lower() not in ("false", "0", "no")
 
     # ------------------------------------------------------------------
     # Entry point
@@ -461,11 +510,103 @@ class Collector:
             self._sync_node_interfaces(node, device_id)
 
         if self._sync_inventory:
-            self._sync_node_inventory(node, device_id)
+            if self._use_modules:
+                self._sync_node_modules(node, device_id)
+            else:
+                self._sync_node_inventory(node, device_id)
 
     def _sync_node_interfaces(self, node: dict, device_id: int) -> None:
-        """Sync NIC / management interfaces reported by XClarity for a node."""
-        # XClarity reports network adapters under several possible keys
+        """Sync NIC / management interfaces reported by XClarity for a node.
+
+        XClarity exposes network ports through PCI device records that carry a
+        ``portInfo.physicalPorts`` list.  Each physical port has a speed (Gbps)
+        and zero or more logical ports that carry the MAC address.
+
+        Older XClarity payloads (or non-standard keys) may instead use the
+        ``adapterList`` / ``adapters`` / ``networkAdapters`` structure which is
+        also handled below for backwards compatibility.
+        """
+        # ----------------------------------------------------------------
+        # 1. PCI-based adapters (new-style: portInfo.physicalPorts)
+        # pciDevices is the union of addinCards + onboardPciDevices
+        # ----------------------------------------------------------------
+        pci_devices: list[dict] = list(
+            node.get("pciDevices")
+            or (list(node.get("addinCards") or []) + list(node.get("onboardPciDevices") or []))
+        )
+
+        for pci_dev in pci_devices:
+            port_info = pci_dev.get("portInfo") or {}
+            physical_ports = port_info.get("physicalPorts") or []
+            if not physical_ports:
+                continue
+
+            dev_name = pci_dev.get("name") or pci_dev.get("productName") or "Adapter"
+
+            for phys_port in physical_ports:
+                port_type_str = (phys_port.get("portType") or "").upper()
+                if "ETHERNET" not in port_type_str and "ETH" not in port_type_str:
+                    continue
+
+                port_num = (
+                    phys_port.get("portNumber")
+                    or phys_port.get("physicalPortIndex")
+                    or "?"
+                )
+                iface_name = f"{dev_name} Port {port_num}"
+
+                # Extract MAC from the first logical port that has one
+                mac = ""
+                for lp in (phys_port.get("logicalPorts") or []):
+                    mac = _normalise_mac(lp.get("addresses") or "")
+                    if mac:
+                        break
+
+                # Speed is reported in Gbps on physical ports
+                speed_gbps = phys_port.get("speed")
+                iface_type = (
+                    _port_type_gbps(speed_gbps)
+                    if speed_gbps is not None
+                    else _port_type(phys_port)
+                )
+
+                iface_payload: dict[str, Any] = {
+                    "device": device_id,
+                    "name": iface_name,
+                    "type": iface_type,
+                }
+                if mac:
+                    iface_payload["mac_address"] = mac
+
+                iface = self.nb_sync.upsert_interface(iface_payload)
+                iface_id = self.nb_sync._id(iface)
+
+                # IPs attached to logical ports (rare, but supported)
+                if iface_id:
+                    for lp in (phys_port.get("logicalPorts") or []):
+                        for ip_key in ("ipInterfaces", "ipAddresses", "ips"):
+                            for ip_info in lp.get(ip_key) or []:
+                                address = (
+                                    ip_info.get("address")
+                                    or ip_info.get("IPv4addresses")
+                                    or ip_info.get("ipv4Address")
+                                )
+                                if isinstance(address, list):
+                                    address = address[0] if address else None
+                                if not address:
+                                    continue
+                                cidr = _to_cidr(address, ip_info.get("subnet") or ip_info.get("netmask"))
+                                if cidr:
+                                    self.nb_sync.upsert_ip_address({
+                                        "address": cidr,
+                                        "assigned_object_type": "dcim.interface",
+                                        "assigned_object_id": iface_id,
+                                        "status": "active",
+                                    })
+
+        # ----------------------------------------------------------------
+        # 2. Old-style adapters (adapterList / adapters / networkAdapters)
+        # ----------------------------------------------------------------
         adapters = (
             node.get("adapterList")
             or node.get("adapters")
@@ -478,7 +619,7 @@ class Collector:
                 port_index = port.get("portIndex", "?")
                 iface_name = port.get("portName") or port.get("name") or f"port-{port_index}"
                 mac = _normalise_mac(port.get("macAddress") or port.get("mac") or "")
-                iface_payload: dict[str, Any] = {
+                iface_payload = {
                     "device": device_id,
                     "name": iface_name,
                     "type": _port_type(port),
@@ -488,14 +629,16 @@ class Collector:
 
                 iface = self.nb_sync.upsert_interface(iface_payload)
                 iface_id = self.nb_sync._id(iface)
-
                 if iface_id is None:
                     continue
 
-                # Sync IP addresses on this port
                 for ip_key in ("ipInterfaces", "ipAddresses", "ips"):
                     for ip_info in port.get(ip_key) or []:
-                        address = ip_info.get("IPv4addresses") or ip_info.get("address") or ip_info.get("ipv4Address")
+                        address = (
+                            ip_info.get("IPv4addresses")
+                            or ip_info.get("address")
+                            or ip_info.get("ipv4Address")
+                        )
                         if isinstance(address, list):
                             address = address[0] if address else None
                         if not address:
@@ -509,24 +652,45 @@ class Collector:
                                 "status": "active",
                             })
 
-        # Dedicated management (BMC) IP
-        mgmt_ip = (
-            node.get("mgmtProcIPaddress")
-            or node.get("ipAddress")
-            or node.get("primaryMgmtIPaddress")
-        )
-        if mgmt_ip:
-            cidr = _to_cidr(mgmt_ip)
-            if cidr:
-                # Ensure a management interface exists
-                mgmt_iface = self.nb_sync.upsert_interface({
-                    "device": device_id,
-                    "name": "mgmt0",
-                    "type": "other",
-                    "mgmt_only": True,
-                })
-                mgmt_iface_id = self.nb_sync._id(mgmt_iface)
-                if mgmt_iface_id:
+        # ----------------------------------------------------------------
+        # 3. Management (BMC) interface + IP
+        # ----------------------------------------------------------------
+        mgmt_iface = self.nb_sync.upsert_interface({
+            "device": device_id,
+            "name": "mgmt0",
+            "type": "other",
+            "mgmt_only": True,
+        })
+        mgmt_iface_id = self.nb_sync._id(mgmt_iface)
+
+        if mgmt_iface_id:
+            synced_mgmt_ips: set[str] = set()
+
+            # Prefer ipInterfaces (includes subnet info for proper CIDR)
+            for iface_info in (node.get("ipInterfaces") or []):
+                for assignment in (iface_info.get("IPv4assignments") or []):
+                    addr = assignment.get("address") or ""
+                    if not addr:
+                        continue
+                    cidr = _to_cidr(addr, assignment.get("subnet"))
+                    if cidr:
+                        self.nb_sync.upsert_ip_address({
+                            "address": cidr,
+                            "assigned_object_type": "dcim.interface",
+                            "assigned_object_id": mgmt_iface_id,
+                            "status": "active",
+                        })
+                        synced_mgmt_ips.add(addr)
+
+            # Fall back to top-level mgmt IP fields if not already synced
+            mgmt_ip = (
+                node.get("mgmtProcIPaddress")
+                or node.get("ipAddress")
+                or node.get("primaryMgmtIPaddress")
+            )
+            if mgmt_ip and mgmt_ip not in synced_mgmt_ips:
+                cidr = _to_cidr(mgmt_ip)
+                if cidr:
                     self.nb_sync.upsert_ip_address({
                         "address": cidr,
                         "assigned_object_type": "dcim.interface",
@@ -535,79 +699,149 @@ class Collector:
                     })
 
     def _sync_node_inventory(self, node: dict, device_id: int) -> None:
-        """Sync CPUs, DIMMs, disk drives, add-in cards, PSUs and fans as inventory items."""
+        """Sync CPUs, DIMMs, disk drives, add-in cards, PSUs, fans and
+        backplanes as inventory items (used when COLLECTOR_USE_MODULES=false)."""
         default_mfr_id = self.nb_sync.ensure_manufacturer()
 
         def _item_mfr_id(item: dict) -> Optional[int]:
-            """Return manufacturer ID for *item*, falling back to the device manufacturer."""
             mfr = item.get("manufacturer") or item.get("mfrName") or None
             return self.nb_sync.ensure_manufacturer(mfr) if mfr else default_mfr_id
 
+        # Pre-fetch role IDs once
+        role_cpu = self.nb_sync.ensure_inventory_item_role("CPU")
+        role_memory = self.nb_sync.ensure_inventory_item_role("Memory")
+        role_storage = self.nb_sync.ensure_inventory_item_role("Storage")
+        role_adapter = self.nb_sync.ensure_inventory_item_role("Adapter")
+        role_psu = self.nb_sync.ensure_inventory_item_role("Power Supply")
+        role_fan = self.nb_sync.ensure_inventory_item_role("Fan")
+
+        # ------------------------------------------------------------------
         # CPUs
+        # ------------------------------------------------------------------
         for cpu in node.get("processors") or node.get("processorSlots") or []:
-            name = cpu.get("productName") or cpu.get("description") or f"CPU {cpu.get('slot', '?')}"
+            # socket ("CPU 1") is the best slot name; fall back to slot/description
+            name = (
+                cpu.get("socket")
+                or cpu.get("productName")
+                or cpu.get("description")
+                or f"CPU {cpu.get('slot', '?')}"
+            )
+            # maxSpeedMHZ is the turbo/max speed; base speed is in GHz
+            speed_mhz = cpu.get("maxSpeedMHZ")
+            speed_desc = f"{speed_mhz} MHz" if speed_mhz else (
+                f"{cpu['speed']} GHz" if cpu.get("speed") else ""
+            )
             desc_parts = [
-                cpu.get("model") or "",
-                f"{cpu['speed']} MHz" if cpu.get("speed") else "",
+                cpu.get("productVersion") or cpu.get("model") or "",
+                speed_desc,
                 f"{cpu['cores']} cores" if cpu.get("cores") else "",
             ]
-            self.nb_sync.upsert_inventory_item({
+            payload: dict[str, Any] = {
                 "device": device_id,
                 "name": name,
                 "manufacturer": _item_mfr_id(cpu),
-                "part_id": cpu.get("partNumber") or "",
+                # displayName carries the full model string (e.g. "Intel(R) Xeon(R) Gold 6240")
+                "part_id": cpu.get("displayName") or cpu.get("partNumber") or "",
                 "serial": cpu.get("serialNumber") or "",
                 "description": ", ".join(p for p in desc_parts if p),
-            })
+            }
+            if role_cpu:
+                payload["role"] = role_cpu
+            self.nb_sync.upsert_inventory_item(payload)
 
+        # ------------------------------------------------------------------
         # Memory / DIMMs
+        # ------------------------------------------------------------------
         for dimm in node.get("memoryModules") or node.get("dimmSlots") or []:
-            name = dimm.get("productName") or dimm.get("description") or f"DIMM {dimm.get('slot', '?')}"
+            # displayName gives the slot label ("DIMM 1"); fall back to slot number
+            name = (
+                dimm.get("displayName")
+                or dimm.get("productName")
+                or dimm.get("description")
+                or f"DIMM {dimm.get('slot', '?')}"
+            )
+            # capacity is in GB in XClarity
             capacity = dimm.get("capacity") or dimm.get("size") or ""
             desc_parts = [
-                f"{capacity} MB" if capacity else "",
+                f"{capacity} GB" if capacity else "",
                 f"{dimm['speed']} MHz" if dimm.get("speed") else "",
-                dimm.get("memoryType") or dimm.get("type") or "",
+                dimm.get("memoryType") or dimm.get("type") or dimm.get("model") or "",
             ]
-            self.nb_sync.upsert_inventory_item({
+            payload = {
                 "device": device_id,
                 "name": name,
                 "manufacturer": _item_mfr_id(dimm),
                 "part_id": dimm.get("partNumber") or "",
                 "serial": dimm.get("serialNumber") or "",
                 "description": ", ".join(p for p in desc_parts if p),
-            })
+            }
+            if role_memory:
+                payload["role"] = role_memory
+            self.nb_sync.upsert_inventory_item(payload)
 
+        # ------------------------------------------------------------------
         # Disk drives
-        for drive in (
+        # Drives appear in raidSettings[*].diskDrives (capacity in bytes),
+        # and may also be at the top level under several key names.
+        # Deduplicate by serial or UUID to avoid double-counting.
+        # ------------------------------------------------------------------
+        seen_drives: set[str] = set()
+        all_drives: list[dict] = []
+
+        def _collect_drive(d: dict) -> None:
+            key = d.get("serialNumber") or d.get("uuid") or d.get("name") or str(id(d))
+            if key not in seen_drives:
+                seen_drives.add(key)
+                all_drives.append(d)
+
+        for d in (
             node.get("diskDrives")
             or node.get("drives")
             or node.get("storageDisks")
             or node.get("diskDriveList")
             or []
         ):
+            _collect_drive(d)
+
+        # raidSettings hold the primary drive inventory (with capacity in bytes)
+        for ctrl in (node.get("raidSettings") or []):
+            for d in (ctrl.get("diskDrives") or []):
+                _collect_drive(d)
+
+        for drive in all_drives:
             name = (
-                drive.get("productName")
+                drive.get("name")
+                or drive.get("productName")
                 or drive.get("description")
-                or drive.get("name")
-                or f"Drive {drive.get('slot', '?')}"
+                or f"Drive {drive.get('bay', drive.get('slot', '?'))}"
             )
+            # Capacity may be raw bytes (>1 MB threshold) or already in GB
+            capacity_raw = drive.get("capacity") or 0
+            if capacity_raw > 1_000_000:
+                capacity_gb = round(capacity_raw / 1_000_000_000)
+            else:
+                capacity_gb = int(capacity_raw) if capacity_raw else 0
             desc_parts = [
-                f"{drive['capacity']} GB" if drive.get("capacity") else "",
-                drive.get("type") or drive.get("interfaceType") or "",
+                f"{capacity_gb} GB" if capacity_gb else "",
+                drive.get("mediaType") or drive.get("type") or drive.get("interfaceType") or "",
                 f"{drive['rpm']} RPM" if drive.get("rpm") else "",
                 drive.get("model") or "",
             ]
-            self.nb_sync.upsert_inventory_item({
+            payload = {
                 "device": device_id,
                 "name": name,
                 "manufacturer": _item_mfr_id(drive),
                 "part_id": drive.get("partNumber") or "",
                 "serial": drive.get("serialNumber") or "",
                 "description": ", ".join(p for p in desc_parts if p),
-            })
+            }
+            if role_storage:
+                payload["role"] = role_storage
+            self.nb_sync.upsert_inventory_item(payload)
 
+        # ------------------------------------------------------------------
         # Add-in cards (PCIe)
+        # ------------------------------------------------------------------
         for card in (
             node.get("addinCards")
             or node.get("pciExpressCards")
@@ -619,56 +853,96 @@ class Collector:
                 card.get("productName")
                 or card.get("description")
                 or card.get("name")
-                or f"Addin Card {card.get('slot', '?')}"
+                or f"Addin Card {card.get('slotNumber', card.get('slot', '?'))}"
             )
             desc_parts = [
                 f"PCI bus {card['pciBusNumber']}" if card.get("pciBusNumber") else "",
-                f"Slot {card['slot']}" if card.get("slot") else "",
+                f"Slot {card.get('slotNumber', card.get('slot', ''))}" if card.get("slotNumber") or card.get("slot") else "",
                 card.get("slotName") or "",
-                card.get("type") or "",
+                card.get("class") or card.get("type") or "",
             ]
-            self.nb_sync.upsert_inventory_item({
+            payload = {
                 "device": device_id,
                 "name": name,
                 "manufacturer": _item_mfr_id(card),
                 "part_id": card.get("partNumber") or "",
-                "serial": card.get("serialNumber") or "",
+                # fruSerialNumber is the FRU-level serial on XClarity add-in cards
+                "serial": card.get("serialNumber") or card.get("fruSerialNumber") or "",
                 "description": ", ".join(p for p in desc_parts if p),
-            })
+            }
+            if role_adapter:
+                payload["role"] = role_adapter
+            self.nb_sync.upsert_inventory_item(payload)
 
-            # Sync ethernet ports from this add-in card as device interfaces
-            if self._sync_interfaces:
-                self._sync_addin_card_interfaces(card, device_id)
-
+        # ------------------------------------------------------------------
         # Power supplies
+        # ------------------------------------------------------------------
         for psu in node.get("powerSupplies") or node.get("powerSupplySlots") or []:
-            name = psu.get("productName") or psu.get("description") or f"PSU {psu.get('slot', '?')}"
+            name = psu.get("name") or psu.get("productName") or psu.get("description") or f"PSU {psu.get('slot', '?')}"
+            # Output watts lives under powerAllocation in real XClarity responses
+            output_watts = (
+                psu.get("outputWatts")
+                or (psu.get("powerAllocation") or {}).get("totalOutputPower")
+            )
+            # Input voltage type: prefer flag then string field
+            if psu.get("inputVoltageIsAC") is True:
+                input_voltage = "AC"
+            elif psu.get("inputVoltageIsAC") is False:
+                input_voltage = "DC"
+            else:
+                input_voltage = psu.get("inputVoltageType") or ""
             desc_parts = [
                 psu.get("model") or "",
-                psu.get("inputVoltageType") or "",
-                f"{psu['outputWatts']} W" if psu.get("outputWatts") else "",
+                input_voltage,
+                f"{output_watts} W" if output_watts else "",
             ]
-            self.nb_sync.upsert_inventory_item({
+            payload = {
                 "device": device_id,
                 "name": name,
                 "manufacturer": _item_mfr_id(psu),
                 "part_id": psu.get("partNumber") or "",
                 "serial": psu.get("serialNumber") or "",
                 "description": ", ".join(p for p in desc_parts if p),
-            })
+            }
+            if role_psu:
+                payload["role"] = role_psu
+            self.nb_sync.upsert_inventory_item(payload)
 
+        # ------------------------------------------------------------------
         # Fans
+        # ------------------------------------------------------------------
         for fan in node.get("fans") or node.get("fanSlots") or []:
             name = fan.get("name") or fan.get("description") or f"Fan {fan.get('slot', '?')}"
             desc_parts = [f"{fan['speed']} RPM" if fan.get("speed") else ""]
-            self.nb_sync.upsert_inventory_item({
+            payload = {
                 "device": device_id,
                 "name": name,
                 "manufacturer": _item_mfr_id(fan),
                 "part_id": fan.get("partNumber") or "",
                 "serial": fan.get("serialNumber") or "",
                 "description": ", ".join(p for p in desc_parts if p),
-            })
+            }
+            if role_fan:
+                payload["role"] = role_fan
+            self.nb_sync.upsert_inventory_item(payload)
+
+        # ------------------------------------------------------------------
+        # Backplanes (faceplateIDs)
+        # ------------------------------------------------------------------
+        role_backplane = self.nb_sync.ensure_inventory_item_role("Backplane")
+        for bp in (node.get("faceplateIDs") or []):
+            name = bp.get("name") or f"Backplane {bp.get('deviceId', '?')}"
+            payload = {
+                "device": device_id,
+                "name": name,
+                "manufacturer": default_mfr_id,
+                "part_id": bp.get("partNumber") or bp.get("fruNumber") or "",
+                "serial": bp.get("serialNumber") or "",
+                "description": "",
+            }
+            if role_backplane:
+                payload["role"] = role_backplane
+            self.nb_sync.upsert_inventory_item(payload)
 
     def _sync_addin_card_interfaces(self, card: dict, device_id: int) -> None:
         """Sync ethernet ports from a PCIe add-in card as device interfaces."""

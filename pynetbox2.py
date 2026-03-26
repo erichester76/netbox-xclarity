@@ -45,7 +45,8 @@ FK_FIELDS = {
     "dcim.device_roles": [],
     "dcim.platforms": ["manufacturer"],
     "dcim.virtual_chassis": [],
-    "dcim.inventory_items": ["device"],
+    "dcim.inventory_items": ["device", "role"],
+    "dcim.inventory_item_roles": [],
     "dcim.device_bays": ["device"],
     "dcim.module_types": ["manufacturer"],
     "dcim.modules": ["device", "module_bay", "module_type"],
@@ -746,6 +747,7 @@ def _default_diode_entity_builder(resource: str, data: Mapping[str, Any]) -> Any
         "dcim.platforms": "platform",
         "dcim.virtual_chassis": "virtual_chassis",
         "dcim.inventory_items": "inventory_item",
+        "dcim.inventory_item_roles": "inventory_item_role",
         "dcim.device_bays": "device_bay",
         "dcim.module_types": "module_type",
         "dcim.modules": "module",
@@ -1289,6 +1291,7 @@ class NetBoxExtendedClient:
         "dcim.virtual_chassis": "virtualchassis",
         "dcim.device_bays": "devicebay",
         "dcim.inventory_items": "inventoryitem",
+        "dcim.inventory_item_roles": "inventoryitemrole",
         "dcim.virtual_device_contexts": "virtualdevicecontext",
         "dcim.platforms": "platform",
         "extras.config_contexts": "configcontext",
@@ -1572,6 +1575,13 @@ class NetBoxExtendedClient:
         # Helper: normalize tags/lists
         def norm_list(lst):
             return sorted([normalize(x) for x in lst])
+
+        # NetBox choice fields are returned as {"value": ..., "label": ...} dicts.
+        # Normalize them to just the value string so that e.g. "active" compares
+        # equal to {"value": "active", "label": "Active"} and spurious updates
+        # for fields like status/face are avoided.
+        if isinstance(value, dict) and "value" in value and "label" in value:
+            return normalize(value["value"])
 
         # Dict normalization
         if isinstance(value, dict):
