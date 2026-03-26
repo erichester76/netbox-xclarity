@@ -328,12 +328,34 @@ class NetBoxSync:
     # Module bay (slot instance on a device)
     # ------------------------------------------------------------------
 
-    def ensure_module_bay(self, device_id: int, name: str) -> Optional[int]:
+    def ensure_module_bay(self, device_id: int, name: str, position: str = "") -> Optional[int]:
         """Return the NetBox ID for a module bay on a device, creating it if needed."""
+        payload: dict[str, Any] = {"device": device_id, "name": name}
+        if position:
+            payload["position"] = position
         obj = self._upsert(
             "dcim.module_bays",
-            {"device": device_id, "name": name},
+            payload,
             lookup_fields=["device", "name"],
+        )
+        return self._id(obj)
+
+    # ------------------------------------------------------------------
+    # Module type profile
+    # ------------------------------------------------------------------
+
+    def ensure_module_type_profile(self, name: str) -> Optional[int]:
+        """Return the NetBox ID for a module type profile, creating it if needed.
+
+        Module type profiles (NetBox 4.0+) allow grouping module types and
+        attaching shared custom fields to each category (CPU, Memory, etc.).
+        If the endpoint does not exist (pre-4.0) the call returns None silently.
+        """
+        slug = _slugify(name)
+        obj = self._upsert(
+            "dcim.module_type_profiles",
+            {"name": name, "slug": slug},
+            lookup_fields=["slug"],
         )
         return self._id(obj)
 
@@ -341,15 +363,34 @@ class NetBoxSync:
     # Module type
     # ------------------------------------------------------------------
 
-    def ensure_module_type(self, model: str, manufacturer_name: Optional[str] = None) -> Optional[int]:
-        """Return the NetBox ID for a module type, creating it if needed."""
+    def ensure_module_type(
+        self,
+        model: str,
+        manufacturer_name: Optional[str] = None,
+        profile_name: Optional[str] = None,
+    ) -> Optional[int]:
+        """Return the NetBox ID for a module type, creating it if needed.
+
+        *profile_name*, when supplied, is used to look up or create a
+        ``ModuleTypeProfile`` (NetBox 4.0+) which is then linked to the
+        module type via the ``profile`` field.
+        """
         if not model:
             return None
         slug = _slugify(model)
         manufacturer_id = self.ensure_manufacturer(manufacturer_name)
+        payload: dict[str, Any] = {
+            "manufacturer": manufacturer_id,
+            "model": model,
+            "slug": slug,
+        }
+        if profile_name:
+            profile_id = self.ensure_module_type_profile(profile_name)
+            if profile_id is not None:
+                payload["profile"] = profile_id
         obj = self._upsert(
             "dcim.module_types",
-            {"manufacturer": manufacturer_id, "model": model, "slug": slug},
+            payload,
             lookup_fields=["manufacturer", "slug"],
         )
         return self._id(obj)
@@ -369,6 +410,14 @@ class NetBoxSync:
     def upsert_interface(self, payload: dict[str, Any]) -> Optional[Any]:
         """Create or update an interface on a device."""
         return self._upsert("dcim.interfaces", payload, lookup_fields=["device", "name"])
+
+    # ------------------------------------------------------------------
+    # Power port
+    # ------------------------------------------------------------------
+
+    def upsert_power_port(self, payload: dict[str, Any]) -> Optional[Any]:
+        """Create or update a power port on a device (or module)."""
+        return self._upsert("dcim.power_ports", payload, lookup_fields=["device", "name"])
 
     # ------------------------------------------------------------------
     # IP address
@@ -529,16 +578,25 @@ class Collector:
         if device_id is None:
             return
 
+        if self._sync_inventory and self._use_modules:
+            # Sync modules first so the slot→module map is available when
+            # creating interfaces (interfaces reference their parent module).
+            slot_module_map = self._sync_node_modules(node, device_id)
+        else:
+            slot_module_map = {}
+
         if self._sync_interfaces:
-            self._sync_node_interfaces(node, device_id)
+            self._sync_node_interfaces(node, device_id, module_map=slot_module_map)
 
-        if self._sync_inventory:
-            if self._use_modules:
-                self._sync_node_modules(node, device_id)
-            else:
-                self._sync_node_inventory(node, device_id)
+        if self._sync_inventory and not self._use_modules:
+            self._sync_node_inventory(node, device_id)
 
-    def _sync_node_interfaces(self, node: dict, device_id: int) -> None:
+    def _sync_node_interfaces(
+        self,
+        node: dict,
+        device_id: int,
+        module_map: Optional[dict[str, int]] = None,
+    ) -> None:
         """Sync NIC / management interfaces reported by XClarity for a node.
 
         XClarity exposes network ports through PCI device records that carry a
@@ -548,24 +606,78 @@ class Collector:
         Older XClarity payloads (or non-standard keys) may instead use the
         ``adapterList`` / ``adapters`` / ``networkAdapters`` structure which is
         also handled below for backwards compatibility.
+
+        *module_map* is a dict mapping module-bay name → NetBox module ID,
+        built by ``_sync_node_modules`` when running in modules mode.  When
+        supplied, each PCI-adapter interface is linked to the module installed
+        in the corresponding bay so that NetBox shows the interface under the
+        correct installed component.
         """
+        if module_map is None:
+            module_map = {}
+
         # ----------------------------------------------------------------
         # 1. PCI-based adapters (new-style: portInfo.physicalPorts)
-        # pciDevices is the union of addinCards + onboardPciDevices
+        #
+        # Process onboard devices (LOM) separately from add-in cards so that
+        # the first onboard ethernet port can be identified as the management
+        # (ILOM/LOM) interface instead of creating a synthetic "mgmt0".
         # ----------------------------------------------------------------
-        pci_devices: list[dict] = list(
-            node.get("pciDevices")
-            or (list(node.get("addinCards") or []) + list(node.get("onboardPciDevices") or []))
-        )
 
-        for pci_dev in pci_devices:
+        # When node.get("pciDevices") already provides a combined list we
+        # cannot distinguish onboard from add-in.  Prefer the split lists
+        # when available.
+        if node.get("pciDevices"):
+            # Pre-combined: identify onboard devices by name heuristic
+            onboard_pci_devices: list[dict] = [
+                d for d in node.get("pciDevices")
+                if any(
+                    kw in (d.get("name") or d.get("productName") or "").upper()
+                    for kw in ("LOM", "ONBOARD", "INTEGRATED", "EMBEDDED")
+                )
+            ]
+            addin_pci_devices: list[dict] = [
+                d for d in node.get("pciDevices")
+                if d not in onboard_pci_devices
+            ]
+        else:
+            onboard_pci_devices = list(node.get("onboardPciDevices") or [])
+            addin_pci_devices = list(node.get("addinCards") or [])
+
+        # The first ethernet port on the first onboard device becomes the
+        # management (ILOM / LOM) interface; its ID is used for the BMC IP.
+        mgmt_iface_id: Optional[int] = None
+
+        def _sync_pci_device_ports(
+            pci_dev: dict,
+            is_first_onboard: bool = False,
+        ) -> Optional[int]:
+            """Sync all ethernet ports from *pci_dev*.
+
+            Returns the ID of the first ethernet interface when
+            *is_first_onboard* is True (used as the management interface),
+            or None otherwise.
+            """
             port_info = pci_dev.get("portInfo") or {}
             physical_ports = port_info.get("physicalPorts") or []
             if not physical_ports:
-                continue
+                return None
 
             dev_name = pci_dev.get("name") or pci_dev.get("productName") or "Adapter"
 
+            # Derive the slot name the same way _sync_node_modules does so
+            # we can look the installed module up in module_map.
+            slot_name = (
+                pci_dev.get("slotName")
+                or (
+                    f"PCIe Slot {pci_dev.get('slotNumber', pci_dev.get('slot', '?'))}"
+                    if pci_dev.get("slotNumber") or pci_dev.get("slot")
+                    else None
+                )
+            )
+            module_id = module_map.get(slot_name) if slot_name else None
+
+            first_eth_iface_id: Optional[int] = None
             for phys_port in physical_ports:
                 port_type_str = (phys_port.get("portType") or "").upper()
                 if "ETHERNET" not in port_type_str and "ETH" not in port_type_str:
@@ -600,9 +712,18 @@ class Collector:
                 }
                 if mac:
                     iface_payload["mac_address"] = mac
+                if module_id is not None:
+                    iface_payload["module"] = module_id
+                # Mark the first port of the first onboard adapter as
+                # management-only (this is the LOM / ILOM port).
+                if is_first_onboard and first_eth_iface_id is None:
+                    iface_payload["mgmt_only"] = True
 
                 iface = self.nb_sync.upsert_interface(iface_payload)
                 iface_id = self.nb_sync._id(iface)
+
+                if first_eth_iface_id is None and iface_id is not None:
+                    first_eth_iface_id = iface_id
 
                 # IPs attached to logical ports (rare, but supported)
                 if iface_id:
@@ -626,6 +747,19 @@ class Collector:
                                         "assigned_object_id": iface_id,
                                         "status": "active",
                                     })
+
+            return first_eth_iface_id if is_first_onboard else None
+
+        # Process onboard (LOM) devices first; capture the management iface ID
+        # from the first onboard device's first ethernet port.
+        for idx, pci_dev in enumerate(onboard_pci_devices):
+            result = _sync_pci_device_ports(pci_dev, is_first_onboard=(idx == 0))
+            if idx == 0 and result is not None:
+                mgmt_iface_id = result
+
+        # Process add-in cards
+        for pci_dev in addin_pci_devices:
+            _sync_pci_device_ports(pci_dev)
 
         # ----------------------------------------------------------------
         # 2. Old-style adapters (adapterList / adapters / networkAdapters)
@@ -676,15 +810,21 @@ class Collector:
                             })
 
         # ----------------------------------------------------------------
-        # 3. Management (BMC) interface + IP
+        # 3. Management (BMC / ILOM) interface + IP
+        #
+        # Prefer the first onboard LOM port identified above.  If none was
+        # found (e.g. no onboard PCI device data) fall back to creating a
+        # dedicated interface named after the first LOM port.
         # ----------------------------------------------------------------
-        mgmt_iface = self.nb_sync.upsert_interface({
-            "device": device_id,
-            "name": "mgmt0",
-            "type": "other",
-            "mgmt_only": True,
-        })
-        mgmt_iface_id = self.nb_sync._id(mgmt_iface)
+        if mgmt_iface_id is None:
+            # No onboard interface found; create a placeholder LOM interface.
+            lom_iface = self.nb_sync.upsert_interface({
+                "device": device_id,
+                "name": "LOM Port 1",
+                "type": "other",
+                "mgmt_only": True,
+            })
+            mgmt_iface_id = self.nb_sync._id(lom_iface)
 
         if mgmt_iface_id:
             synced_mgmt_ips: set[str] = set()
@@ -967,7 +1107,7 @@ class Collector:
                 payload["role"] = role_backplane
             self.nb_sync.upsert_inventory_item(payload)
 
-    def _sync_node_modules(self, node: dict, device_id: int) -> None:
+    def _sync_node_modules(self, node: dict, device_id: int) -> dict[str, int]:
         """Sync hardware components as NetBox Modules (used when COLLECTOR_USE_MODULES=true).
 
         The NetBox module model closely mirrors physical reality:
@@ -980,7 +1120,9 @@ class Collector:
 
         * A **ModuleType** captures the make & model of an installed component
           (e.g. "Intel(R) Xeon(R) Gold 6240 CPU @ 2.60GHz").  Module types
-          are reusable across devices.
+          are reusable across devices.  A **ModuleTypeProfile** (NetBox 4.0+)
+          groups related module types and enables category-specific custom
+          fields.
 
         * A **Module** is the installed instance – it lives in a specific
           ``ModuleBay`` on a specific ``Device`` and carries the serial number.
@@ -989,6 +1131,10 @@ class Collector:
         creation they are safe to call even when the device already exists;
         the template will simply be skipped on the device type and the bay
         ensured directly on the device.
+
+        Returns a dict mapping bay/slot name → installed NetBox module ID.
+        This is consumed by ``_sync_node_interfaces`` to attach interfaces to
+        the correct module.
         """
         # Retrieve the device_type_id from the device record so we can add
         # bay templates to it.
@@ -1013,24 +1159,30 @@ class Collector:
                 device_id,
                 exc,
             )
+        # Maps bay_name → module_id; returned to the caller so interfaces can
+        # be linked to the correct module.
+        slot_module_map: dict[str, int] = {}
 
         def _ensure_slot(bay_name: str, position: str = "") -> Optional[int]:
             """Ensure a bay template + bay instance exist; return the bay ID."""
             if device_type_id is not None:
                 self.nb_sync.ensure_module_bay_template(device_type_id, bay_name, position)
-            return self.nb_sync.ensure_module_bay(device_id, bay_name)
+            return self.nb_sync.ensure_module_bay(device_id, bay_name, position)
 
         def _install_module(
             bay_id: Optional[int],
+            bay_name: str,
             model: str,
             serial: str,
             mfr_name: Optional[str],
-        ) -> None:
+            profile_name: Optional[str] = None,
+        ) -> Optional[int]:
+            """Install a module in *bay_id*; return its NetBox ID (or None)."""
             if bay_id is None or not model:
-                return
-            module_type_id = self.nb_sync.ensure_module_type(model, mfr_name)
+                return None
+            module_type_id = self.nb_sync.ensure_module_type(model, mfr_name, profile_name)
             if module_type_id is None:
-                return
+                return None
             payload: dict[str, Any] = {
                 "device": device_id,
                 "module_bay": bay_id,
@@ -1039,7 +1191,11 @@ class Collector:
             }
             if serial:
                 payload["serial"] = serial
-            self.nb_sync.upsert_module(payload)
+            module = self.nb_sync.upsert_module(payload)
+            module_id = self.nb_sync._id(module)
+            if module_id is not None and bay_name:
+                slot_module_map[bay_name] = module_id
+            return module_id
 
         # ------------------------------------------------------------------
         # CPUs
@@ -1058,7 +1214,7 @@ class Collector:
                 or cpu.get("model")
                 or ""
             )
-            _install_module(bay_id, model, cpu.get("serialNumber") or "", cpu.get("manufacturer"))
+            _install_module(bay_id, bay_name, model, cpu.get("serialNumber") or "", cpu.get("manufacturer"), "CPU")
 
         # ------------------------------------------------------------------
         # Memory / DIMMs
@@ -1076,7 +1232,7 @@ class Collector:
             mem_type = dimm.get("type") or dimm.get("memoryType") or dimm.get("model") or ""
             part = dimm.get("partNumber") or ""
             model = part or (f"{capacity}GB {mem_type}".strip() if capacity or mem_type else "")
-            _install_module(bay_id, model, dimm.get("serialNumber") or "", dimm.get("manufacturer"))
+            _install_module(bay_id, bay_name, model, dimm.get("serialNumber") or "", dimm.get("manufacturer"), "Memory")
 
         # ------------------------------------------------------------------
         # Disk drives (from raidSettings and top-level)
@@ -1100,7 +1256,7 @@ class Collector:
             media = drive.get("mediaType") or drive.get("interfaceType") or ""
             part = drive.get("partNumber") or ""
             model_str = drive.get("model") or part or (f"{capacity_gb}GB {media}".strip() if capacity_gb or media else "")
-            _install_module(bay_id, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"))
+            _install_module(bay_id, bay_name, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"), "Storage")
 
         for d in (node.get("diskDrives") or node.get("drives") or node.get("storageDisks") or node.get("diskDriveList") or []):
             _sync_drive_module(d)
@@ -1123,7 +1279,7 @@ class Collector:
             bay_id = _ensure_slot(slot_name, position)
             model = card.get("productName") or card.get("name") or card.get("description") or ""
             serial = card.get("serialNumber") or card.get("fruSerialNumber") or ""
-            _install_module(bay_id, model, serial, card.get("manufacturer"))
+            _install_module(bay_id, slot_name, model, serial, card.get("manufacturer"), "Expansion Card")
 
         # ------------------------------------------------------------------
         # Power supplies
@@ -1135,7 +1291,16 @@ class Collector:
             bay_name = psu.get("name") or psu.get("description") or f"Power Supply {position}"
             bay_id = _ensure_slot(bay_name, position)
             model = psu.get("partNumber") or psu.get("model") or psu.get("productName") or ""
-            _install_module(bay_id, model, psu.get("serialNumber") or "", psu.get("manufacturer"))
+            module_id = _install_module(bay_id, bay_name, model, psu.get("serialNumber") or "", psu.get("manufacturer"), "Power Supply")
+            # Add a C14 power inlet port to the PSU module so the power draw
+            # can be tracked and cables can be attached.
+            if module_id is not None:
+                self.nb_sync.upsert_power_port({
+                    "device": device_id,
+                    "module": module_id,
+                    "name": "Power Input",
+                    "type": "iec-60320-c14",
+                })
 
         # ------------------------------------------------------------------
         # Fans
@@ -1146,7 +1311,7 @@ class Collector:
             bay_id = _ensure_slot(bay_name, position)
             # Fans rarely have a meaningful model; skip module install if no part number
             model = fan.get("partNumber") or fan.get("model") or ""
-            _install_module(bay_id, model, fan.get("serialNumber") or "", fan.get("manufacturer"))
+            _install_module(bay_id, bay_name, model, fan.get("serialNumber") or "", fan.get("manufacturer"), "Fan")
 
         # ------------------------------------------------------------------
         # Backplanes (faceplateIDs)
@@ -1155,7 +1320,9 @@ class Collector:
             bay_name = bp.get("name") or f"Backplane {bp.get('deviceId', '?')}"
             bay_id = _ensure_slot(bay_name)
             model = bp.get("partNumber") or bp.get("fruNumber") or ""
-            _install_module(bay_id, model, bp.get("serialNumber") or "", None)
+            _install_module(bay_id, bay_name, model, bp.get("serialNumber") or "", None)
+
+        return slot_module_map
 
     def _get_device_type_id(self, device_id: int) -> Optional[int]:
         """Retrieve the device_type ID for an existing device."""
