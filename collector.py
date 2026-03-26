@@ -1777,9 +1777,9 @@ def _apply_regex(value: str, pattern: str, replacement: str) -> str:
 def _build_model_name(device: dict) -> str:
     """Build a combined device-type model name from XClarity fields.
 
-    Format: ``<manufacturer> <productName> -[<machineType><model>]-``
+    Format: ``<productName> -[<machineType><model>]-``
 
-    Example: ``Lenovo ThinkSystem SR650 -[7X06CTO1WW]-``
+    Example: ``ThinkSystem SR650 -[7X06CTO1WW]-``
 
     Falls back to ``machineType`` or ``model`` alone when the richer fields
     are absent, so behaviour is backwards-compatible.
@@ -1789,8 +1789,6 @@ def _build_model_name(device: dict) -> str:
     machine_type = device.get("machineType", "")
     model_code = device.get("model", "")
     parts: list[str] = []
-    if manufacturer:
-        parts.append(manufacturer)
     if product_name:
         parts.append(product_name)
     suffix = f"{machine_type}{model_code}".strip()
