@@ -1314,7 +1314,7 @@ class Collector:
                 self.nb_sync.upsert_power_port({
                     "device": device_id,
                     "module": module_id,
-                    "name": f"Power Input {i}",
+                    "name": f"Power Input {position if position != '' else i}",
                     "type": "iec-60320-c14",
                 })
 
