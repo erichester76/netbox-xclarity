@@ -1236,7 +1236,7 @@ class Collector:
             media = drive.get("mediaType") or drive.get("interfaceType") or ""
             part = drive.get("partNumber") or ""
             model_str = drive.get("model") or part or (f"{capacity_gb}GB {media}".strip() if capacity_gb or media else "")
-            _install_module(bay_id, bay_name, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"), "Storage")
+            _install_module(bay_id, bay_name, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"), "Hard disk")
 
         for d in (node.get("diskDrives") or node.get("drives") or node.get("storageDisks") or node.get("diskDriveList") or []):
             _sync_drive_module(d)
@@ -1259,7 +1259,7 @@ class Collector:
             bay_id = _ensure_slot(slot_name, position)
             model = card.get("productName") or card.get("name") or card.get("description") or ""
             serial = card.get("serialNumber") or card.get("fruSerialNumber") or ""
-            _install_module(bay_id, slot_name, model, serial, card.get("manufacturer"), "Expansion Card")
+            _install_module(bay_id, slot_name, model, serial, card.get("manufacturer"), "Expansion card")
 
         # ------------------------------------------------------------------
         # Power supplies
@@ -1271,7 +1271,7 @@ class Collector:
             bay_name = psu.get("name") or psu.get("description") or f"Power Supply {position}"
             bay_id = _ensure_slot(bay_name, position)
             model = psu.get("partNumber") or psu.get("model") or psu.get("productName") or ""
-            module_id = _install_module(bay_id, bay_name, model, psu.get("serialNumber") or "", psu.get("manufacturer"), "Power Supply")
+            module_id = _install_module(bay_id, bay_name, model, psu.get("serialNumber") or "", psu.get("manufacturer"), "Power supply")
             # Add a C14 power inlet port to the PSU module so the power draw
             # can be tracked and cables can be attached.
             if module_id is not None:
