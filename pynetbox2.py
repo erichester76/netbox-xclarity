@@ -51,6 +51,7 @@ FK_FIELDS = {
     "dcim.module_types": ["manufacturer"],
     "dcim.modules": ["device", "module_bay", "module_type"],
     "dcim.module_bays": ["device"],
+    "dcim.module_bay_templates": ["device_type"],
     "dcim.power_feeds": ["power_panel"],
     "dcim.power_outlets": ["device", "power_port"],
     "dcim.power_panels": ["site"],
@@ -752,6 +753,7 @@ def _default_diode_entity_builder(resource: str, data: Mapping[str, Any]) -> Any
         "dcim.module_types": "module_type",
         "dcim.modules": "module",
         "dcim.module_bays": "module_bay",
+        "dcim.module_bay_templates": "module_bay_template",
         "dcim.power_feeds": "power_feed",
         "dcim.power_outlets": "power_outlet",
         "dcim.power_panels": "power_panel",
@@ -1282,6 +1284,7 @@ class NetBoxExtendedClient:
         "dcim.module_bays": "modulebay",
         "dcim.module_types": "moduletype",
         "dcim.modules": "module",
+        "dcim.module_bay_templates": "modulebaytemplates",
         "dcim.power_feeds": "powerfeed",
         "dcim.power_outlets": "poweroutlet",
         "dcim.power_panels": "powerpanel",
@@ -1789,6 +1792,14 @@ class NetBoxExtendedClient:
             return "site_id"
         if resource == "dcim.interfaces" and field == "device":
             return "device_id"
+        if resource in ("dcim.module_bays", "dcim.modules", "dcim.inventory_items") and field == "device":
+            return "device_id"
+        if resource == "dcim.modules" and field == "module_bay":
+            return "module_bay_id"
+        if resource == "dcim.module_bay_templates" and field == "device_type":
+            return "device_type_id"
+        if resource == "dcim.module_types" and field == "manufacturer":
+            return "manufacturer_id"
         if resource == "virtualization.interfaces" and field == "virtual_machine":
             return "virtual_machine_id"
         if resource == "virtualization.virtual_machines" and field == "cluster":

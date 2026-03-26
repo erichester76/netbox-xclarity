@@ -38,6 +38,12 @@ import pynetbox2  # noqa: E402  (after sys.path manipulation)
 
 logger = logging.getLogger(__name__)
 
+# Capacity values above this threshold (in raw units from XClarity) are
+# assumed to be in bytes and converted to GB.  Values at or below the
+# threshold are assumed to already be in GB (some older XClarity versions
+# report capacity in GB directly).
+_CAPACITY_BYTES_THRESHOLD = 1_000_000
+
 # ---------------------------------------------------------------------------
 # XClarity client
 # ---------------------------------------------------------------------------
@@ -298,6 +304,23 @@ class NetBoxSync:
             "dcim.inventory_item_roles",
             {"name": name, "slug": slug, "color": "9e9e9e"},
             lookup_fields=["slug"],
+        )
+        return self._id(obj)
+
+    def ensure_module_bay_template(self, device_type_id: int, name: str, position: str = "") -> Optional[int]:
+        """Return the NetBox ID for a module bay template on a device type, creating it if needed.
+
+        Module bay templates are the blueprint entries attached to a device type.
+        When a device is created from that type, NetBox instantiates a matching
+        ``ModuleBay`` for every template automatically.
+        """
+        payload: dict[str, Any] = {"device_type": device_type_id, "name": name}
+        if position:
+            payload["position"] = position
+        obj = self._upsert(
+            "dcim.module_bay_templates",
+            payload,
+            lookup_fields=["device_type", "name"],
         )
         return self._id(obj)
 
@@ -815,9 +838,9 @@ class Collector:
                 or drive.get("description")
                 or f"Drive {drive.get('bay', drive.get('slot', '?'))}"
             )
-            # Capacity may be raw bytes (>1 MB threshold) or already in GB
+            # Capacity may be raw bytes (>threshold) or already in GB
             capacity_raw = drive.get("capacity") or 0
-            if capacity_raw > 1_000_000:
+            if capacity_raw > _CAPACITY_BYTES_THRESHOLD:
                 capacity_gb = round(capacity_raw / 1_000_000_000)
             else:
                 capacity_gb = int(capacity_raw) if capacity_raw else 0
@@ -944,47 +967,196 @@ class Collector:
                 payload["role"] = role_backplane
             self.nb_sync.upsert_inventory_item(payload)
 
-    def _sync_addin_card_interfaces(self, card: dict, device_id: int) -> None:
-        """Sync ethernet ports from a PCIe add-in card as device interfaces."""
-        ports = card.get("portList") or card.get("ports") or []
-        for port in ports:
-            port_type_str = (port.get("type") or port.get("portType") or "").lower()
-            if "ethernet" not in port_type_str and "eth" not in port_type_str:
-                continue
-            port_index = port.get("portIndex", "?")
-            iface_name = port.get("portName") or port.get("name") or f"port-{port_index}"
-            mac = _normalise_mac(port.get("macAddress") or port.get("mac") or "")
-            iface_payload: dict[str, Any] = {
+    def _sync_node_modules(self, node: dict, device_id: int) -> None:
+        """Sync hardware components as NetBox Modules (used when COLLECTOR_USE_MODULES=true).
+
+        The NetBox module model closely mirrors physical reality:
+
+        * A **ModuleBayTemplate** on the *DeviceType* declares that a slot
+          exists (e.g. "CPU Socket 1").  NetBox auto-creates matching
+          ``ModuleBay`` instances when a device is first created from that
+          type.  We also create them here explicitly so that devices that
+          pre-date the templates still get populated.
+
+        * A **ModuleType** captures the make & model of an installed component
+          (e.g. "Intel(R) Xeon(R) Gold 6240 CPU @ 2.60GHz").  Module types
+          are reusable across devices.
+
+        * A **Module** is the installed instance – it lives in a specific
+          ``ModuleBay`` on a specific ``Device`` and carries the serial number.
+
+        Because ``ModuleBayTemplate`` additions happen *before* device
+        creation they are safe to call even when the device already exists;
+        the template will simply be skipped on the device type and the bay
+        ensured directly on the device.
+        """
+        # Retrieve the device_type_id from the device record so we can add
+        # bay templates to it.
+        device_type_id = self._get_device_type_id(device_id)
+
+        def _ensure_slot(bay_name: str, position: str = "") -> Optional[int]:
+            """Ensure a bay template + bay instance exist; return the bay ID."""
+            if device_type_id is not None:
+                self.nb_sync.ensure_module_bay_template(device_type_id, bay_name, position)
+            return self.nb_sync.ensure_module_bay(device_id, bay_name)
+
+        def _install_module(
+            bay_id: Optional[int],
+            model: str,
+            serial: str,
+            mfr_name: Optional[str],
+        ) -> None:
+            if bay_id is None or not model:
+                return
+            module_type_id = self.nb_sync.ensure_module_type(model, mfr_name)
+            if module_type_id is None:
+                return
+            payload: dict[str, Any] = {
                 "device": device_id,
-                "name": iface_name,
-                "type": _port_type(port),
+                "module_bay": bay_id,
+                "module_type": module_type_id,
+                "status": "active",
             }
-            if mac:
-                iface_payload["mac_address"] = mac
-            iface = self.nb_sync.upsert_interface(iface_payload)
-            iface_id = self.nb_sync._id(iface)
-            if iface_id is None:
-                continue
-            # Sync IP addresses on this port
-            for ip_key in ("ipInterfaces", "ipAddresses", "ips"):
-                for ip_info in port.get(ip_key) or []:
-                    address = (
-                        ip_info.get("IPv4addresses")
-                        or ip_info.get("address")
-                        or ip_info.get("ipv4Address")
-                    )
-                    if isinstance(address, list):
-                        address = address[0] if address else None
-                    if not address:
-                        continue
-                    cidr = _to_cidr(address, ip_info.get("subnet") or ip_info.get("netmask"))
-                    if cidr:
-                        self.nb_sync.upsert_ip_address({
-                            "address": cidr,
-                            "assigned_object_type": "dcim.interface",
-                            "assigned_object_id": iface_id,
-                            "status": "active",
-                        })
+            if serial:
+                payload["serial"] = serial
+            self.nb_sync.upsert_module(payload)
+
+        # ------------------------------------------------------------------
+        # CPUs
+        # ------------------------------------------------------------------
+        for cpu in node.get("processors") or node.get("processorSlots") or []:
+            bay_name = (
+                cpu.get("socket")
+                or cpu.get("productName")
+                or f"CPU {cpu.get('slot', '?')}"
+            )
+            position = str(cpu.get("slot", ""))
+            bay_id = _ensure_slot(bay_name, position)
+            model = (
+                cpu.get("displayName")
+                or cpu.get("productVersion")
+                or cpu.get("model")
+                or ""
+            )
+            _install_module(bay_id, model, cpu.get("serialNumber") or "", cpu.get("manufacturer"))
+
+        # ------------------------------------------------------------------
+        # Memory / DIMMs
+        # ------------------------------------------------------------------
+        for dimm in node.get("memoryModules") or node.get("dimmSlots") or []:
+            bay_name = (
+                dimm.get("displayName")
+                or dimm.get("productName")
+                or f"DIMM {dimm.get('slot', '?')}"
+            )
+            position = str(dimm.get("slot", ""))
+            bay_id = _ensure_slot(bay_name, position)
+            # Model name: part number + capacity + type gives a useful identifier
+            capacity = dimm.get("capacity") or ""
+            mem_type = dimm.get("type") or dimm.get("memoryType") or dimm.get("model") or ""
+            part = dimm.get("partNumber") or ""
+            model = part or (f"{capacity}GB {mem_type}".strip() if capacity or mem_type else "")
+            _install_module(bay_id, model, dimm.get("serialNumber") or "", dimm.get("manufacturer"))
+
+        # ------------------------------------------------------------------
+        # Disk drives (from raidSettings and top-level)
+        # ------------------------------------------------------------------
+        seen_drives: set[str] = set()
+
+        def _sync_drive_module(drive: dict) -> None:
+            key = drive.get("serialNumber") or drive.get("uuid") or drive.get("name") or str(id(drive))
+            if key in seen_drives:
+                return
+            seen_drives.add(key)
+            bay_name = (
+                drive.get("name")
+                or drive.get("description")
+                or f"Drive Bay {drive.get('bay', drive.get('slot', '?'))}"
+            )
+            position = str(drive.get("bay", drive.get("slot", "")))
+            bay_id = _ensure_slot(bay_name, position)
+            capacity_raw = drive.get("capacity") or 0
+            capacity_gb = round(capacity_raw / 1_000_000_000) if capacity_raw > _CAPACITY_BYTES_THRESHOLD else int(capacity_raw) if capacity_raw else 0
+            media = drive.get("mediaType") or drive.get("interfaceType") or ""
+            part = drive.get("partNumber") or ""
+            model_str = drive.get("model") or part or (f"{capacity_gb}GB {media}".strip() if capacity_gb or media else "")
+            _install_module(bay_id, model_str, drive.get("serialNumber") or "", drive.get("manufacturer"))
+
+        for d in (node.get("diskDrives") or node.get("drives") or node.get("storageDisks") or node.get("diskDriveList") or []):
+            _sync_drive_module(d)
+        for ctrl in (node.get("raidSettings") or []):
+            for d in (ctrl.get("diskDrives") or []):
+                _sync_drive_module(d)
+
+        # ------------------------------------------------------------------
+        # Add-in cards (PCIe)
+        # ------------------------------------------------------------------
+        for card in (
+            node.get("addinCards")
+            or node.get("pciExpressCards")
+            or node.get("pciCards")
+            or node.get("addinCardList")
+            or []
+        ):
+            slot_name = card.get("slotName") or f"PCIe Slot {card.get('slotNumber', card.get('slot', '?'))}"
+            position = str(card.get("slotNumber") or card.get("slot") or "")
+            bay_id = _ensure_slot(slot_name, position)
+            model = card.get("productName") or card.get("name") or card.get("description") or ""
+            serial = card.get("serialNumber") or card.get("fruSerialNumber") or ""
+            _install_module(bay_id, model, serial, card.get("manufacturer"))
+
+        # ------------------------------------------------------------------
+        # Power supplies
+        # ------------------------------------------------------------------
+        for psu in node.get("powerSupplies") or node.get("powerSupplySlots") or []:
+            # slots is a list; take the first element as position
+            slots = psu.get("slots") or []
+            position = str(slots[0]) if slots else str(psu.get("slot", ""))
+            bay_name = psu.get("name") or psu.get("description") or f"Power Supply {position}"
+            bay_id = _ensure_slot(bay_name, position)
+            model = psu.get("partNumber") or psu.get("model") or psu.get("productName") or ""
+            _install_module(bay_id, model, psu.get("serialNumber") or "", psu.get("manufacturer"))
+
+        # ------------------------------------------------------------------
+        # Fans
+        # ------------------------------------------------------------------
+        for fan in node.get("fans") or node.get("fanSlots") or []:
+            position = str(fan.get("slot") or fan.get("slots") or "")
+            bay_name = fan.get("name") or fan.get("description") or f"Fan {position}"
+            bay_id = _ensure_slot(bay_name, position)
+            # Fans rarely have a meaningful model; skip module install if no part number
+            model = fan.get("partNumber") or fan.get("model") or ""
+            _install_module(bay_id, model, fan.get("serialNumber") or "", fan.get("manufacturer"))
+
+        # ------------------------------------------------------------------
+        # Backplanes (faceplateIDs)
+        # ------------------------------------------------------------------
+        for bp in (node.get("faceplateIDs") or []):
+            bay_name = bp.get("name") or f"Backplane {bp.get('deviceId', '?')}"
+            bay_id = _ensure_slot(bay_name)
+            model = bp.get("partNumber") or bp.get("fruNumber") or ""
+            _install_module(bay_id, model, bp.get("serialNumber") or "", None)
+
+    def _get_device_type_id(self, device_id: int) -> Optional[int]:
+        """Retrieve the device_type ID for an existing device."""
+        try:
+            device = self.nb_sync.nb.get("dcim.devices", id=device_id)
+            if device is None:
+                return None
+            if isinstance(device, dict):
+                dt = device.get("device_type")
+                if isinstance(dt, dict):
+                    return dt.get("id")
+                return dt
+            dt = getattr(device, "device_type", None)
+            if dt is None:
+                return None
+            if isinstance(dt, dict):
+                return dt.get("id")
+            return getattr(dt, "id", None)
+        except Exception as exc:
+            logger.warning("Could not retrieve device_type for device %s: %s", device_id, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Chassis
@@ -1323,6 +1495,24 @@ def _port_type(port: dict) -> str:
     if "25g" in speed or "25000" in nums:
         return "25gbase-x-sfp28"
     if "10g" in speed or "10000" in nums:
+        return "10gbase-t"
+    return "1000base-t"
+
+
+def _port_type_gbps(speed_gbps: Any) -> str:
+    """Infer a NetBox interface type from a raw Gbps integer (as reported by
+    XClarity ``portInfo.physicalPorts[*].speed``)."""
+    try:
+        gbps = int(speed_gbps)
+    except (TypeError, ValueError):
+        return "1000base-t"
+    if gbps >= 100:
+        return "100gbase-x-qsfp28"
+    if gbps >= 40:
+        return "40gbase-x-qsfpp"
+    if gbps >= 25:
+        return "25gbase-x-sfp28"
+    if gbps >= 10:
         return "10gbase-t"
     return "1000base-t"
 
