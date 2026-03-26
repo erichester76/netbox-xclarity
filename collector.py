@@ -378,6 +378,12 @@ class NetBoxSync:
         *attributes*, when supplied, is stored as ``attribute_data`` on the
         module type so that profile-specific fields (e.g. CPU cores/speed) are
         visible on the type record in NetBox.
+
+        The profile is applied in a dedicated first request so that it is
+        persisted before ``attribute_data`` is sent.  NetBox validates
+        attribute values against the profile schema; sending both fields in
+        a single request causes the attributes to be silently ignored on
+        some NetBox versions (order-of-operations issue).
         """
         if not model:
             return None
@@ -392,16 +398,29 @@ class NetBoxSync:
             profile_id = self.ensure_module_type_profile(profile_name)
             if profile_id is not None:
                 payload["profile"] = profile_id
-        if attributes:
-            clean_attrs = {k: v for k, v in attributes.items() if v is not None}
-            if clean_attrs:
-                payload["attribute_data"] = clean_attrs
+        # Step 1: create/update the module type with the profile set.
+        # attribute_data is intentionally omitted here so that the profile is
+        # committed to NetBox before attributes are applied in step 2.
         obj = self._upsert(
             "dcim.module_types",
             payload,
             lookup_fields=["manufacturer", "slug"],
         )
-        return self._id(obj)
+        module_type_id = self._id(obj)
+
+        # Step 2: apply attribute_data in a separate request after the profile
+        # has been persisted.  NetBox validates attribute values against the
+        # profile's schema, so the profile must already be set.
+        if module_type_id and attributes:
+            clean_attrs = {k: v for k, v in attributes.items() if v is not None}
+            if clean_attrs:
+                self._upsert(
+                    "dcim.module_types",
+                    {"id": module_type_id, "attribute_data": clean_attrs},
+                    lookup_fields=["id"],
+                )
+
+        return module_type_id
 
     # ------------------------------------------------------------------
     # Module (installed component)
