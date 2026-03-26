@@ -1,0 +1,20 @@
+services:
+  xclarity-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xclarity-sync:latest
+    env_file: .env
+    volumes:
+      - ./collector.py:/app/collector.py
+      - ./pynetbox2.py:/app/pynetbox2.py
+    networks:
+      - o11y
+    environment:
+      - PYTHONUNBUFFERED=1 
+    command: ["sh", "-c", "python3 collector.py && echo Waiting for $${RESTART_DELAY:-30} seconds to restart && sleep $${RESTART_DELAY:-30}"]
+    restart: unless-stopped
+
+networks:
+  o11y:
+    external: true
