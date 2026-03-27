@@ -16,6 +16,7 @@ take precedence.  See ``.env.example`` for the full list of supported keys.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import os
 import re
@@ -732,6 +733,7 @@ class Collector:
         self._sync_interfaces = _env("COLLECTOR_SYNC_INTERFACES", "true").lower() not in ("false", "0", "no")
         self._sync_inventory = _env("COLLECTOR_SYNC_INVENTORY", "true").lower() not in ("false", "0", "no")
         self._use_modules = _env("COLLECTOR_USE_MODULES", "false").lower() not in ("false", "0", "no")
+        self._max_workers = int(_env("COLLECTOR_MAX_WORKERS", "10"))
 
     # ------------------------------------------------------------------
     # Entry point
@@ -752,6 +754,41 @@ class Collector:
         logger.info("Collector finished.")
 
     # ------------------------------------------------------------------
+    # Parallel dispatch helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _device_name(device: dict) -> str:
+        """Return a human-readable identifier for *device* suitable for log messages."""
+        return (
+            device.get("name")
+            or device.get("hostname")
+            or device.get("uuid", "unknown")
+        )
+
+    def _run_parallel(self, items: list, sync_func, category: str) -> None:
+        """Submit *sync_func(item)* for every item in *items* via a thread pool.
+
+        Exceptions raised by individual sync calls are caught and logged so
+        that a failure for one device does not abort the rest of the batch.
+        *max_workers* comes from the ``COLLECTOR_MAX_WORKERS`` environment
+        variable (default: 10).
+        """
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            futures = {executor.submit(sync_func, item): item for item in items}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    item = futures[future]
+                    logger.error(
+                        "Unhandled error syncing %s %s: %s",
+                        category,
+                        self._device_name(item),
+                        exc,
+                    )
+
+    # ------------------------------------------------------------------
     # Nodes (servers)
     # ------------------------------------------------------------------
 
@@ -764,8 +801,7 @@ class Collector:
             return
 
         logger.info("Found %d node(s).", len(nodes))
-        for node in nodes:
-            self._sync_node(node)
+        self._run_parallel(nodes, self._sync_node, "node")
 
     def _sync_node(self, node: dict) -> None:
         raw_name = node.get("name") or node.get("hostname") or node.get("uuid", "unknown")
@@ -1611,8 +1647,7 @@ class Collector:
             return
 
         logger.info("Found %d chassis.", len(chassis_list))
-        for chassis in chassis_list:
-            self._sync_chassis(chassis)
+        self._run_parallel(chassis_list, self._sync_chassis, "chassis")
 
     def _sync_chassis(self, chassis: dict) -> None:
         raw_name = chassis.get("name") or chassis.get("hostname") or chassis.get("uuid", "unknown")
@@ -1669,8 +1704,7 @@ class Collector:
             return
 
         logger.info("Found %d switch(es).", len(switches))
-        for switch in switches:
-            self._sync_switch(switch)
+        self._run_parallel(switches, self._sync_switch, "switch")
 
     def _sync_switch(self, switch: dict) -> None:
         raw_name = switch.get("name") or switch.get("hostname") or switch.get("uuid", "unknown")
@@ -1748,8 +1782,7 @@ class Collector:
             return
 
         logger.info("Found %d storage device(s).", len(storage_list))
-        for storage in storage_list:
-            self._sync_storage(storage)
+        self._run_parallel(storage_list, self._sync_storage, "storage")
 
     def _sync_storage(self, storage: dict) -> None:
         raw_name = storage.get("name") or storage.get("hostname") or storage.get("uuid", "unknown")
