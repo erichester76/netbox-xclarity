@@ -598,7 +598,7 @@ class BackendAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def update(self, resource: str, object_id: Any, data: Mapping[str, Any]) -> Any:
+    def update(self, resource: str, object_id: Any, data: Mapping[str, Any], existing_record: Any = None) -> Any:
         raise NotImplementedError
 
     @abstractmethod
@@ -703,9 +703,11 @@ class PynetboxAdapter(BackendAdapter):
         endpoint = self._endpoint(resource)
         return self._call(endpoint.create, dict(data))
 
-    def update(self, resource: str, object_id: Any, data: Mapping[str, Any]) -> Any:
+    def update(self, resource: str, object_id: Any, data: Mapping[str, Any], existing_record: Any = None) -> Any:
         endpoint = self._endpoint(resource)
-        record = self._call(endpoint.get, id=object_id)
+        record = existing_record
+        if record is None:
+            record = self._call(endpoint.get, id=object_id)
         if record is None:
             return None
         for key, value in data.items():
@@ -1083,7 +1085,7 @@ class DiodeAdapter(BackendAdapter):
         """Manually flush any remaining entities in the buffer."""
         self._flush_entity_buffer()
 
-    def update(self, resource: str, object_id: Any, data: Mapping[str, Any]) -> Any:
+    def update(self, resource: str, object_id: Any, data: Mapping[str, Any], existing_record: Any = None) -> Any:
         payload = dict(data)
         payload.setdefault("id", object_id)
         self._ingest(resource, payload)
@@ -1686,6 +1688,7 @@ class NetBoxExtendedClient:
             return
         key = self._cache_key(resource, "get", filters)
         self.cache.set(key, record)
+        self._set_get_cache_by_id(resource, record)
 
     def _set_get_cache_by_id(self, resource: str, record: Any) -> None:
         object_id = self._extract_id(record)
@@ -1855,6 +1858,7 @@ class NetBoxExtendedClient:
                 )
                 if result is not None:
                     self.cache.set(key, result)
+                    self._set_get_cache_by_id(resource, result)
                 return result
         else:
             self._inc_cache_metric("get_bypass")
@@ -1869,6 +1873,7 @@ class NetBoxExtendedClient:
         )
         if use_cache and result is not None:
             self.cache.set(key, result)
+            self._set_get_cache_by_id(resource, result)
         return result
 
     def list(self, resource: str, use_cache: bool = True, **filters: Any) -> list[Any]:
@@ -1919,7 +1924,8 @@ class NetBoxExtendedClient:
             object_id,
             sorted(payload.keys()),
         )
-        updated = self.adapter.update(resource, object_id, payload)
+        cached_record = self.cache.get(self._cache_key(resource, "get", {"id": object_id}))
+        updated = self.adapter.update(resource, object_id, payload, existing_record=cached_record)
         logger.debug("NetBox update complete resource=%s id=%s", resource, object_id)
         self._invalidate_resource_list_cache(resource)
         if updated is not None:
