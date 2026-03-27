@@ -496,6 +496,21 @@ class NetBoxSync:
             logger.error("Failed to upsert %s payload=%s: %s", resource, payload, exc)
             return None
 
+    def _update(
+        self,
+        resource: str,
+        object_id: int,
+        data: dict[str, Any],
+    ) -> Optional[Any]:
+        if self.dry_run:
+            logger.info("[DRY-RUN] update %s id=%s %s", resource, object_id, data)
+            return None
+        try:
+            return self.nb.update(resource, object_id, data)
+        except Exception as exc:
+            logger.error("Failed to update %s id=%s data=%s: %s", resource, object_id, data, exc)
+            return None
+
     @staticmethod
     def _id(obj: Any) -> Optional[int]:
         if obj is None:
@@ -851,18 +866,36 @@ class Collector:
         # 3. Management (BMC / ILOM) interface + IP
         #
         # Prefer the first onboard LOM port identified above.  If none was
-        # found (e.g. no onboard PCI device data) fall back to creating a
-        # dedicated interface named after the first LOM port.
+        # found (e.g. no onboard PCI device data) search existing interfaces
+        # for one whose name contains "LOM Port 1" (e.g. "Intel X722 LOM Port 1").
+        # Do NOT create a synthetic interface named "LOM Port 1".
         # ----------------------------------------------------------------
         if mgmt_iface_id is None:
-            # No onboard interface found; create a placeholder LOM interface.
-            lom_iface = self.nb_sync.upsert_interface({
-                "device": device_id,
-                "name": "LOM Port 1",
-                "type": "other",
-                "mgmt_only": True,
-            })
-            mgmt_iface_id = self.nb_sync._id(lom_iface)
+            # No onboard interface captured; look for an existing interface
+            # whose name contains "LOM PORT 1" (case-insensitive substring match,
+            # e.g. "Intel X722 LOM Port 1").
+            try:
+                ifaces = self.nb_sync.nb.list("dcim.interfaces", device=device_id)
+                for iface in ifaces:
+                    if isinstance(iface, dict):
+                        iface_name = iface.get("name") or ""
+                        iface_id = iface.get("id")
+                    else:
+                        iface_name = getattr(iface, "name", "") or ""
+                        iface_id = getattr(iface, "id", None)
+                    if "LOM PORT 1" in iface_name.upper():
+                        mgmt_iface_id = iface_id
+                        logger.debug(
+                            "Found management interface %r (id=%s) for device %s",
+                            iface_name, mgmt_iface_id, device_id,
+                        )
+                        break
+            except Exception as exc:
+                logger.warning(
+                    "Could not search interfaces for device %s: %s", device_id, exc
+                )
+
+        oob_ip_id: Optional[int] = None
 
         if mgmt_iface_id:
             synced_mgmt_ips: set[str] = set()
@@ -875,13 +908,15 @@ class Collector:
                         continue
                     cidr = _to_cidr(addr, assignment.get("subnet"))
                     if cidr:
-                        self.nb_sync.upsert_ip_address({
+                        ip_obj = self.nb_sync.upsert_ip_address({
                             "address": cidr,
                             "assigned_object_type": "dcim.interface",
                             "assigned_object_id": mgmt_iface_id,
                             "status": "active",
                         })
                         synced_mgmt_ips.add(addr)
+                        if oob_ip_id is None:
+                            oob_ip_id = self.nb_sync._id(ip_obj)
 
             # Fall back to top-level mgmt IP fields if not already synced
             mgmt_ip = (
@@ -892,12 +927,20 @@ class Collector:
             if mgmt_ip and mgmt_ip not in synced_mgmt_ips:
                 cidr = _to_cidr(mgmt_ip)
                 if cidr:
-                    self.nb_sync.upsert_ip_address({
+                    ip_obj = self.nb_sync.upsert_ip_address({
                         "address": cidr,
                         "assigned_object_type": "dcim.interface",
                         "assigned_object_id": mgmt_iface_id,
                         "status": "active",
                     })
+                    if oob_ip_id is None:
+                        oob_ip_id = self.nb_sync._id(ip_obj)
+
+        # Set the management IP as the OOB IP on the device.
+        # The first mgmt IP synced is used; additional IPs on the same
+        # interface represent aliases and are not promoted to OOB.
+        if oob_ip_id is not None:
+            self.nb_sync._update("dcim.devices", device_id, {"oob_ip": oob_ip_id})
 
     def _sync_node_inventory(self, node: dict, device_id: int) -> None:
         """Sync CPUs, DIMMs, disk drives, add-in cards, PSUs, fans and
