@@ -705,13 +705,18 @@ class PynetboxAdapter(BackendAdapter):
 
     def update(self, resource: str, object_id: Any, data: Mapping[str, Any]) -> Any:
         endpoint = self._endpoint(resource)
-        record = self._call(endpoint.get, id=object_id)
-        if record is None:
-            return None
-        for key, value in data.items():
-            setattr(record, key, value)
-        self._call(record.save)
-        return record
+        # Use endpoint.update([{id, ...fields}]) to send a direct bulk PATCH
+        # to the collection URL.  This bypasses pynetbox's record-level diff /
+        # save() mechanism, which only serialises fields that were present in
+        # the initial GET response.  JSON fields like ``attribute_data`` are
+        # often absent from GET responses on freshly-created objects, causing
+        # setattr + save() to silently discard them.
+        payload = dict(data)
+        payload["id"] = object_id
+        results = self._call(endpoint.update, [payload])
+        if isinstance(results, list) and results:
+            return results[0]
+        return None
 
     def delete(self, resource: str, object_id: Any) -> bool:
         endpoint = self._endpoint(resource)
