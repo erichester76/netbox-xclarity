@@ -53,15 +53,15 @@ Lenovo XClarity Administrator
    XClarityClient
         │  JSON payloads
         ▼
-   Collector  ──────────────────────────────────────────────────────────────┐
-        │  upsert devices, interfaces, inventory / modules, IPs             │
-        ▼                                                                    │
-   NetBoxSync  (prerequisite objects: site, rack, role, manufacturer …)     │
-        │                                                                    │
-        ▼                                                                    │
-   NetBoxExtendedClient  (caching · rate-limiting · retry · diff)           │
-        │                                                                    │
-        ├─── PynetboxAdapter  ─── pynetbox  ─── NetBox REST API             │
+   Collector  ─────────────────────────────────────────────────────────────┐
+        │  upsert devices, interfaces, inventory / modules, IPs            │
+        ▼                                                                  │
+   NetBoxSync  (prerequisite objects: site, rack, role, manufacturer …)    │
+        │                                                                  │
+        ▼                                                                  │
+   NetBoxExtendedClient  (caching · rate-limiting · retry · diff)          │
+        │                                                                  │
+        ├─── PynetboxAdapter  ─── pynetbox  ─── NetBox REST API            │
         └─── DiodeAdapter     ─── Diode SDK ─── NetBox (write-through) ◄───┘
 ```
 
