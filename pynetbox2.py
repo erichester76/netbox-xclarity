@@ -1724,6 +1724,7 @@ class NetBoxExtendedClient:
             "dcim.module_bay_templates": ["device_type", "name"],
             "dcim.module_types": ["manufacturer", "slug"],
             "dcim.modules": ["device", "module_bay"],
+            "dcim.sites": ["name", "slug"],
             "virtualization.clusters": ["name", "group"],
             "virtualization.virtual_machines": ["name", "cluster"],
             "virtualization.interfaces": ["name", "virtual_machine"],
