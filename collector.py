@@ -216,7 +216,14 @@ class NetBoxSync:
     # ------------------------------------------------------------------
 
     def ensure_device_type(self, model: str, part_number: str = "", manufacturer_name: Optional[str] = None) -> Optional[int]:
-        """Return the NetBox ID for a device type, creating it if needed."""
+        """Return the NetBox ID for a device type, creating it if needed.
+
+        Device types are looked up by ``manufacturer`` + ``model`` (which is
+        unique in NetBox) rather than by ``slug`` because a device type may
+        have been created in NetBox manually – or by a previous version of this
+        code that generated a different slug – causing a slug-based lookup to
+        return zero results even though the device type already exists.
+        """
         if not model:
             return None
         slug = _slugify(model)
@@ -228,7 +235,7 @@ class NetBoxSync:
         }
         if part_number:
             payload["part_number"] = part_number
-        obj = self._upsert("dcim.device_types", payload, lookup_fields=["manufacturer", "slug"])
+        obj = self._upsert("dcim.device_types", payload, lookup_fields=["manufacturer", "model"])
         return self._id(obj)
 
     # ------------------------------------------------------------------
@@ -1796,6 +1803,7 @@ def _slugify(value: str) -> str:
     value = re.sub(r"[^\w\s-]", "", value)
     value = re.sub(r"[\s_]+", "-", value)
     value = re.sub(r"-+", "-", value)
+    value = value.strip("-")
     return value[:100]
 
 
