@@ -244,8 +244,14 @@ class NetBoxSync:
     # ------------------------------------------------------------------
 
     def ensure_site(self, name: str, slug: str) -> Optional[int]:
-        """Return the NetBox ID for a site, creating it if needed."""
-        obj = self._upsert("dcim.sites", {"name": name, "slug": slug}, lookup_fields=["slug"])
+        """Return the NetBox ID for a site, creating it if needed.
+
+        Sites are looked up by ``name`` (which is unique in NetBox) rather than
+        ``slug`` because a site may have been created in NetBox manually with a
+        different slug than the one generated here, causing a slug-based lookup
+        to return zero results even though the site already exists.
+        """
+        obj = self._upsert("dcim.sites", {"name": name, "slug": slug}, lookup_fields=["name"])
         return self._id(obj)
 
     # ------------------------------------------------------------------
