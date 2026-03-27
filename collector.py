@@ -402,6 +402,12 @@ class NetBoxSync:
         attribute values against the profile schema; sending both fields in
         a single request causes the attributes to be silently ignored on
         some NetBox versions (order-of-operations issue).
+
+        Module types are looked up by ``manufacturer`` + ``model`` (which is
+        unique in NetBox) rather than by ``slug`` because two different model
+        names may slugify to the same value (e.g. when they differ only in
+        special characters), causing a slug-based lookup to match the wrong
+        existing module type instead of creating a new one.
         """
         if not model:
             return None
@@ -422,7 +428,7 @@ class NetBoxSync:
         obj = self._upsert(
             "dcim.module_types",
             payload,
-            lookup_fields=["manufacturer", "slug"],
+            lookup_fields=["manufacturer", "model"],
         )
         module_type_id = self._id(obj)
 
@@ -1261,13 +1267,10 @@ class Collector:
             }
             if serial:
                 payload["serial"] = serial
-            # Store profile-specific attributes when available (NetBox 4.0+).
-            # Only include keys whose value is not None so required fields without
-            # data are omitted rather than sent as null.
-            if attributes:
-                clean_attrs = {k: v for k, v in attributes.items() if v is not None}
-                if clean_attrs:
-                    payload["attribute_data"] = clean_attrs
+            # Note: attribute_data is intentionally NOT included here.
+            # Profile-specific attributes belong on the module *type* record
+            # (set in ensure_module_type step 2) and carry forward automatically
+            # to the installed module via the type relationship.
             module = self.nb_sync.upsert_module(payload)
             module_id = self.nb_sync._id(module)
             if module_id is not None and bay_name:
