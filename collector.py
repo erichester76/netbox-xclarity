@@ -44,6 +44,11 @@ logger = logging.getLogger(__name__)
 # report capacity in GB directly).
 _CAPACITY_BYTES_THRESHOLD = 1_000_000
 
+# NetBox limits interface names to 64 characters.  When we build a name as
+# "{card_name} Port {port_num}" the card-name portion is capped here so the
+# full string never exceeds the limit (worst-case suffix " Port XX" = 8 chars).
+_IFACE_CARD_NAME_MAX = 55
+
 # ---------------------------------------------------------------------------
 # XClarity client
 # ---------------------------------------------------------------------------
@@ -721,7 +726,7 @@ class Collector:
                     or phys_port.get("physicalPortIndex")
                     or "?"
                 )
-                iface_name = f"{dev_name} Port {port_num}"
+                iface_name = f"{dev_name[:_IFACE_CARD_NAME_MAX]} Port {port_num}"
 
                 # Extract MAC from the first logical port that has one
                 mac = ""
