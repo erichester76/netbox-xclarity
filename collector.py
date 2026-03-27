@@ -49,6 +49,10 @@ _CAPACITY_BYTES_THRESHOLD = 1_000_000
 # full string never exceeds the limit (worst-case suffix " Port XX" = 8 chars).
 _IFACE_CARD_NAME_MAX = 55
 
+# PSUs with output wattage above this threshold require a C19/C20 connector
+# instead of the lighter-duty C13/C14 pairing.
+_PSU_C20_WATTAGE_THRESHOLD = 1800
+
 # ---------------------------------------------------------------------------
 # XClarity client
 # ---------------------------------------------------------------------------
@@ -1371,14 +1375,15 @@ class Collector:
             bay_id = _ensure_slot(bay_name, position)
             model = psu.get("partNumber") or psu.get("model") or psu.get("productName") or ""
             module_id = _install_module(bay_id, bay_name, model, psu.get("serialNumber") or "", psu.get("manufacturer"), "Power supply", _psu_attributes(psu))
-            # Add a C14 power inlet port to the PSU module so the power draw
+            # Add a power inlet port to the PSU module so the power draw
             # can be tracked and cables can be attached.
+            # Use C20 for high-wattage PSUs (>1800 W), C14 for lower-wattage ones.
             if module_id is not None:
                 self.nb_sync.upsert_power_port({
                     "device": device_id,
                     "module": module_id,
                     "name": f"Power Input {position if position != '' else i}",
-                    "type": "iec-60320-c14",
+                    "type": _psu_plug_type(psu),
                 })
 
         # ------------------------------------------------------------------
@@ -1840,6 +1845,23 @@ def _psu_attributes(psu: dict) -> dict:
     if hot_swap is not None:
         attrs["hot_swappable"] = bool(hot_swap)
     return attrs
+
+
+def _psu_plug_type(psu: dict) -> str:
+    """Return the IEC 60320 inlet plug type for a PSU based on output wattage.
+
+    PSUs above 1800 W draw more current than C13/C14 connectors are rated for,
+    so they require the heavier-duty C19/C20 pairing instead.
+    """
+    try:
+        output_watts = psu.get("outputWatts")
+        if output_watts is None:
+            output_watts = (psu.get("powerAllocation") or {}).get("totalOutputPower")
+        if output_watts is not None and int(output_watts) > _PSU_C20_WATTAGE_THRESHOLD:
+            return "iec-60320-c20"
+    except (ValueError, TypeError):
+        pass
+    return "iec-60320-c14"
 
 
 def _slugify(value: str) -> str:
