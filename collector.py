@@ -1839,7 +1839,7 @@ def _slugify(value: str) -> str:
     value = re.sub(r"[^\w\s-]", "", value)
     value = re.sub(r"[\s_]+", "-", value)
     value = re.sub(r"-+", "-", value)
-    return value[:100]
+    return value[:100].strip("-")
 
 
 def _apply_regex(value: str, pattern: str, replacement: str) -> str:
