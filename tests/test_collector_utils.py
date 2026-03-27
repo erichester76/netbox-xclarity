@@ -20,6 +20,7 @@ from collector import (
     _normalise_mac,
     _port_type,
     _port_type_gbps,
+    _PROFILE_SCHEMAS,
     _psu_attributes,
     _psu_plug_type,
     _slugify,
@@ -463,10 +464,59 @@ class TestPsuAttributes:
         attrs = _psu_attributes({"nominalVoltage": 110})
         assert attrs["input_voltage"] == 110
 
+    def test_input_voltage_defaults_to_120_when_absent(self):
+        """input_voltage is required by the profile schema; must always be set."""
+        attrs = _psu_attributes({})
+        assert attrs["input_voltage"] == 120
+
+    def test_input_voltage_defaults_to_120_on_invalid_value(self):
+        attrs = _psu_attributes({"inputVoltage": "N/A"})
+        assert attrs["input_voltage"] == 120
+
+    def test_required_fields_always_present(self):
+        """Both required schema fields must be present even with empty input."""
+        attrs = _psu_attributes({})
+        assert "input_current" in attrs
+        assert "input_voltage" in attrs
+
 
 # ===========================================================================
-# _expansion_card_attributes
+# _PROFILE_SCHEMAS – Power supply schema
 # ===========================================================================
+
+class TestPowerSupplyProfileSchema:
+    """Verify the Power supply profile schema matches the required NetBox shape."""
+
+    def setup_method(self):
+        self.schema = _PROFILE_SCHEMAS["Power supply"]
+
+    def test_required_fields_listed(self):
+        assert "required" in self.schema
+        assert "input_current" in self.schema["required"]
+        assert "input_voltage" in self.schema["required"]
+
+    def test_input_current_enum(self):
+        props = self.schema["properties"]["input_current"]
+        assert set(props["enum"]) == {"AC", "DC"}
+
+    def test_input_current_default_ac(self):
+        props = self.schema["properties"]["input_current"]
+        assert props["default"] == "AC"
+
+    def test_input_voltage_default_120(self):
+        props = self.schema["properties"]["input_voltage"]
+        assert props["default"] == 120
+
+    def test_hot_swappable_default_false(self):
+        props = self.schema["properties"]["hot_swappable"]
+        assert props["default"] is False
+
+    def test_wattage_has_description(self):
+        props = self.schema["properties"]["wattage"]
+        assert "description" in props
+
+
+
 
 class TestExpansionCardAttributes:
     def test_full_fields(self, sample_expansion_card):

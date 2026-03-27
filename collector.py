@@ -110,11 +110,12 @@ _PROFILE_SCHEMAS: dict[str, dict] = {
     "Power supply": {
         "type": "object",
         "properties": {
-            "input_current":  {"type": "string",  "title": "Input Current Type"},
-            "input_voltage":  {"type": "integer", "title": "Input Voltage (V)"},
-            "wattage":        {"type": "integer", "title": "Wattage (W)"},
-            "hot_swappable":  {"type": "boolean", "title": "Hot Swappable"},
+            "hot_swappable":  {"type": "boolean", "title": "Hot-swappable",   "default": False},
+            "input_current":  {"type": "string",  "title": "Current type",    "default": "AC", "enum": ["AC", "DC"]},
+            "input_voltage":  {"type": "integer", "title": "Voltage",         "default": 120},
+            "wattage":        {"type": "integer", "description": "Available output power (watts)"},
         },
+        "required": ["input_current", "input_voltage"],
     },
 }
 
@@ -1986,17 +1987,16 @@ def _psu_attributes(psu: dict) -> dict:
     else:
         input_v_type = (psu.get("inputVoltageType") or "").upper()
         attrs["input_current"] = "DC" if input_v_type == "DC" else "AC"
-    # input_voltage: required by profile schema
+    # input_voltage: required by profile schema; default to 120 V when absent
     try:
         input_v = (
             psu.get("inputVoltage")
             or psu.get("normalInputVoltage")
             or psu.get("nominalVoltage")
         )
-        if input_v is not None:
-            attrs["input_voltage"] = int(input_v)
+        attrs["input_voltage"] = int(input_v) if input_v is not None else 120
     except (ValueError, TypeError):
-        pass
+        attrs["input_voltage"] = 120
     # wattage (available output power)
     try:
         output_watts = psu.get("outputWatts")
