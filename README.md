@@ -1,6 +1,6 @@
 # netbox-xclarity
 
-**netbox-xclarity** is a Python-based collector that synchronises hardware inventory from a [Lenovo XClarity Administrator](https://www.lenovo.com/us/en/data-center/software/systems-management/xclarity/) instance into [NetBox](https://netbox.dev/). It runs as a lightweight, containerised long-polling loop and keeps NetBox's DCIM inventory up to date without manual data entry.
+**netbox-xclarity** is a Python-based collector that synchronizes hardware inventory from a [Lenovo XClarity Administrator](https://www.lenovo.com/us/en/data-center/software/systems-management/xclarity/) instance into [NetBox](https://netbox.dev/). It runs as a lightweight, containerized long-polling loop and keeps NetBox's DCIM inventory up to date without manual data entry.
 
 ---
 
