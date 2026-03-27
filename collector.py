@@ -432,17 +432,16 @@ class NetBoxSync:
         )
         module_type_id = self._id(obj)
 
-        # Step 2: apply attribute_data in a separate request after the profile
+        # Step 2: apply attribute_data in a direct PATCH after the profile
         # has been persisted.  NetBox validates attribute values against the
-        # profile's schema, so the profile must already be set.
+        # profile's schema, so the profile must already be set.  A direct
+        # _update (PATCH) is used here instead of _upsert so that the
+        # attribute_data is always written without being filtered out by the
+        # diff/cache logic in _upsert.
         if module_type_id and attributes:
             clean_attrs = {k: v for k, v in attributes.items() if v is not None}
             if clean_attrs:
-                self._upsert(
-                    "dcim.module_types",
-                    {"id": module_type_id, "attribute_data": clean_attrs},
-                    lookup_fields=["id"],
-                )
+                self._update("dcim.module_types", module_type_id, {"attribute_data": clean_attrs})
 
         return module_type_id
 
