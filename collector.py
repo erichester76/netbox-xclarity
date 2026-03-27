@@ -59,11 +59,11 @@ _SYNC_TAG_NAME = "XClarity-Sync"
 _SYNC_TAG_SLUG = "xclarity-sync"
 _SYNC_TAG_COLOR = "9e9e9e"
 
-# JSON Schemas for each ModuleTypeProfile.  NetBox's ModuleType.clean()
-# enforces that ``attribute_data`` is valid JSON Schema data when a profile is
-# set.  Critically, if the profile has *no* schema, NetBox wipes
-# ``attribute_data`` to NULL on every save – so every profile we create must
-# carry a schema that covers the attributes we write.
+# JSON Schemas for each ModuleTypeProfile.  NetBox validates the ``attributes``
+# field on a ModuleType against this schema on every save.  Critically, if the
+# profile has *no* schema, NetBox wipes ``attributes`` to NULL on every save –
+# so every profile we create must carry a schema that covers the attributes we
+# write.
 #
 # Schemas use draft-07 / JSON Schema "object" with typed properties.
 # ``additionalProperties`` is intentionally omitted so extra keys are allowed
@@ -492,9 +492,9 @@ class NetBoxSync:
         If the endpoint does not exist (pre-4.0) the call returns None silently.
 
         *schema*, when supplied, is persisted as the profile's JSON Schema.
-        NetBox validates ``attribute_data`` on a ModuleType against this schema
+        NetBox validates ``attributes`` on a ModuleType against this schema
         on every save; if the profile has *no* schema NetBox will wipe the
-        ``attribute_data`` field to NULL.  Always pass a schema when you intend
+        ``attributes`` field to NULL.  Always pass a schema when you intend
         to set attributes on module types that use this profile.
         """
         payload: dict[str, Any] = {"name": name}
@@ -524,17 +524,17 @@ class NetBoxSync:
         ``ModuleTypeProfile`` (NetBox 4.0+) which is then linked to the
         module type via the ``profile`` field.  The profile is always
         created with a JSON Schema (from ``_PROFILE_SCHEMAS``) so that
-        NetBox does not wipe ``attribute_data`` on save.
+        NetBox does not wipe ``attributes`` on save.
 
-        *attributes*, when supplied, is stored as ``attribute_data`` on the
-        module type so that profile-specific fields (e.g. CPU cores/speed) are
-        visible on the type record in NetBox.
+        *attributes*, when supplied, is sent as the ``attributes`` field on
+        the module type so that profile-specific fields (e.g. CPU cores/speed)
+        are visible on the type record in NetBox.
 
         The profile is applied in a dedicated first request so that it is
-        persisted before ``attribute_data`` is sent.  NetBox validates
-        attribute values against the profile schema; sending both fields in
-        a single request causes the attributes to be silently ignored on
-        some NetBox versions (order-of-operations issue).
+        persisted before ``attributes`` is sent.  NetBox validates attribute
+        values against the profile schema; sending both fields in a single
+        request causes the attributes to be silently ignored on some NetBox
+        versions (order-of-operations issue).
 
         Module types are looked up by ``manufacturer`` + ``model`` (which is
         unique in NetBox) rather than by ``slug`` because two different model
@@ -557,7 +557,7 @@ class NetBoxSync:
             if profile_id is not None:
                 payload["profile"] = profile_id
         # Step 1: create/update the module type with the profile set.
-        # attribute_data is intentionally omitted here so that the profile is
+        # attributes is intentionally omitted here so that the profile is
         # committed to NetBox before attributes are applied in step 2.
         obj = self._upsert(
             "dcim.module_types",
@@ -566,16 +566,15 @@ class NetBoxSync:
         )
         module_type_id = self._id(obj)
 
-        # Step 2: apply attribute_data in a direct PATCH after the profile
-        # has been persisted.  NetBox validates attribute values against the
-        # profile's schema, so the profile must already be set.  A direct
-        # _update (PATCH) is used here instead of _upsert so that the
-        # attribute_data is always written without being filtered out by the
-        # diff/cache logic in _upsert.
+        # Step 2: apply attributes in a direct PATCH after the profile has
+        # been persisted.  The NetBox API field is "attributes" (not
+        # "attribute_data").  A direct _update (PATCH) is used here instead
+        # of _upsert so that attributes are always written without being
+        # filtered out by the diff/cache logic in _upsert.
         if module_type_id and attributes:
             clean_attrs = {k: v for k, v in attributes.items() if v is not None}
             if clean_attrs:
-                self._update("dcim.module_types", module_type_id, {"attribute_data": clean_attrs})
+                self._update("dcim.module_types", module_type_id, {"attributes": clean_attrs})
 
         return module_type_id
 
