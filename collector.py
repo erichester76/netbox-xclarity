@@ -53,6 +53,32 @@ _IFACE_CARD_NAME_MAX = 55
 # instead of the lighter-duty C13/C14 pairing.
 _PSU_C20_WATTAGE_THRESHOLD = 1800
 
+# Name, slug and colour used for the tag that is added to every item created
+# or updated by this collector.
+_SYNC_TAG_NAME = "XClarity-Sync"
+_SYNC_TAG_SLUG = "xclarity-sync"
+_SYNC_TAG_COLOR = "9e9e9e"
+
+# NetBox resources that support the ``tags`` field.  The sync tag is appended
+# to every object in these resources when it is created or updated.
+_TAGGABLE_RESOURCES: frozenset[str] = frozenset({
+    "dcim.devices",
+    "dcim.device_roles",
+    "dcim.device_types",
+    "dcim.interfaces",
+    "dcim.inventory_item_roles",
+    "dcim.inventory_items",
+    "dcim.locations",
+    "dcim.manufacturers",
+    "dcim.module_types",
+    "dcim.modules",
+    "dcim.platforms",
+    "dcim.power_ports",
+    "dcim.racks",
+    "dcim.sites",
+    "ipam.ip_addresses",
+})
+
 # ---------------------------------------------------------------------------
 # XClarity client
 # ---------------------------------------------------------------------------
@@ -190,6 +216,7 @@ class NetBoxSync:
         self.nb = nb
         self.dry_run = dry_run
         self._manufacturer_cache: dict[str, int] = {}
+        self._sync_tag_id: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Manufacturer
@@ -214,6 +241,34 @@ class NetBoxSync:
         if mfr_id is not None:
             self._manufacturer_cache[mfr_name] = mfr_id
         return mfr_id
+
+    # ------------------------------------------------------------------
+    # Sync tag
+    # ------------------------------------------------------------------
+
+    def ensure_sync_tag(self) -> Optional[int]:
+        """Return the NetBox ID for the XClarity-Sync tag, creating it if needed.
+
+        The tag is created once per run and the result is cached so that
+        repeated calls do not hit the API again.  A direct ``nb.upsert`` call
+        is used here (bypassing the ``_upsert`` wrapper) to avoid any chance
+        of recursive tag-injection for the tag object itself.
+        """
+        if self._sync_tag_id is not None:
+            return self._sync_tag_id
+        if self.dry_run:
+            logger.info("[DRY-RUN] ensure sync tag %s", _SYNC_TAG_NAME)
+            return None
+        try:
+            obj = self.nb.upsert(
+                "extras.tags",
+                {"name": _SYNC_TAG_NAME, "slug": _SYNC_TAG_SLUG, "color": _SYNC_TAG_COLOR},
+                lookup_fields=["slug"],
+            )
+            self._sync_tag_id = self._id(obj)
+        except Exception as exc:
+            logger.error("Failed to ensure sync tag: %s", exc)
+        return self._sync_tag_id
 
     # ------------------------------------------------------------------
     # Device type
@@ -507,7 +562,10 @@ class NetBoxSync:
             logger.info("[DRY-RUN] upsert %s %s", resource, payload)
             return None
         try:
-            return self.nb.upsert(resource, payload, lookup_fields=lookup_fields)
+            obj = self.nb.upsert(resource, payload, lookup_fields=lookup_fields)
+            if resource in _TAGGABLE_RESOURCES:
+                obj = self._append_sync_tag(resource, obj)
+            return obj
         except Exception as exc:
             logger.error("Failed to upsert %s payload=%s: %s", resource, payload, exc)
             return None
@@ -526,6 +584,42 @@ class NetBoxSync:
         except Exception as exc:
             logger.error("Failed to update %s id=%s data=%s: %s", resource, object_id, data, exc)
             return None
+
+    def _append_sync_tag(self, resource: str, obj: Any) -> Any:
+        """Ensure the XClarity-Sync tag is present on *obj*.
+
+        Existing tags are preserved; the sync tag is only appended when it is
+        not already there.  A direct ``nb.update`` call is used so that the
+        tag injection bypasses the diff/cache logic in pynetbox2's upsert.
+        """
+        if obj is None:
+            return obj
+        obj_id = self._id(obj)
+        if obj_id is None:
+            return obj
+
+        existing_tags = getattr(obj, "tags", None) or []
+        for tag in existing_tags:
+            if getattr(tag, "name", None) == _SYNC_TAG_NAME:
+                return obj  # Already present – nothing to do.
+
+        tag_id = self.ensure_sync_tag()
+        if tag_id is None:
+            return obj
+
+        # Preserve all existing tags and append the sync tag.
+        new_tags = [
+            {"id": getattr(t, "id")}
+            for t in existing_tags
+            if getattr(t, "id", None) is not None
+        ]
+        new_tags.append({"id": tag_id})
+        try:
+            updated = self.nb.update(resource, obj_id, {"tags": new_tags})
+            return updated if updated is not None else obj
+        except Exception as exc:
+            logger.warning("Failed to add sync tag to %s id=%s: %s", resource, obj_id, exc)
+            return obj
 
     @staticmethod
     def _id(obj: Any) -> Optional[int]:
